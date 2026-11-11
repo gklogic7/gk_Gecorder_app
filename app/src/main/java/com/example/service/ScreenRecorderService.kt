@@ -24,6 +24,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
+import android.media.AudioTrack
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaCodec
@@ -48,18 +49,22 @@ import androidx.core.content.FileProvider
 import com.example.MainActivity
 import com.example.R
 import com.example.data.RecorderRepository
+import com.example.model.AudioEncoderCodec
 import com.example.model.AudioSourceMode
 import com.example.model.GestureIconState
 import com.example.model.RecordedClip
 import com.example.model.RecorderConfig
 import com.example.model.RecorderStatus
+import com.example.model.VideoEncoderCodec
 import com.example.model.formatFloatingPointTimecode
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -86,7 +91,7 @@ class ScreenRecorderService : Service() {
     private var currentDisplayWidth: Int = 0
     private var currentDisplayHeight: Int = 0
 
-    // Primary Dual-Stream (Internal + Mic) MediaCodec/MediaMuxer Session
+    // Primary Synchronized Dual-Thread (Internal + Mic / Internal / Mic / No Audio) MediaCodec+MediaMuxer Session
     private var activeMuxSession: MixedAvCaptureSession? = null
 
     // Fallback MediaRecorder if needed
@@ -98,6 +103,8 @@ class ScreenRecorderService : Service() {
     private var currentClipTitle: String = ""
     private var hasActiveAudio: Boolean = false
     private var activeAudioStatusLabel: String = "No Audio"
+    private var activeVideoCodecBadge: String = "H.264"
+    private var activeAudioCodecBadge: String = "AAC 192k"
 
     private var timerJob: Job? = null
     private var multiShotGapJob: Job? = null
@@ -280,7 +287,8 @@ class ScreenRecorderService : Service() {
             it.copy(
                 internalAudioReady = internalSupported,
                 micAudioReady = micSupported,
-                audioStatusDetail = statusDetail
+                audioStatusDetail = statusDetail,
+                liveFps = config.frameRate.fps.toFloat()
             )
         }
     }
@@ -329,15 +337,19 @@ class ScreenRecorderService : Service() {
 
             var internalRecord: AudioRecord? = null
             var micRecord: AudioRecord? = null
+            var calibrationTrack: AudioTrack? = null
 
             try {
-                if ((config.audioSource == AudioSourceMode.INTERNAL_AUDIO ||
-                        config.audioSource == AudioSourceMode.INTERNAL_PLUS_MIC) &&
+                val activeProjection = mediaProjection
+                val wantInternal = config.audioSource == AudioSourceMode.INTERNAL_AUDIO ||
+                    config.audioSource == AudioSourceMode.INTERNAL_PLUS_MIC
+
+                if (wantInternal &&
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-                    mediaProjection != null
+                    activeProjection != null
                 ) {
                     runCatching {
-                        val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+                        val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(activeProjection)
                             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                             .addMatchingUsage(AudioAttributes.USAGE_GAME)
                             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
@@ -362,6 +374,15 @@ class ScreenRecorderService : Service() {
                     }
                 }
 
+                // Start a pleasant calibration test tone on USAGE_MEDIA when testing Internal Audio
+                // so the user hears the audio check and AudioPlaybackCapture immediately captures a real signal
+                if (wantInternal) {
+                    runCatching {
+                        calibrationTrack = createCalibrationAudioTrack(sampleRate)
+                        calibrationTrack?.play()
+                    }
+                }
+
                 if (config.audioSource == AudioSourceMode.MICROPHONE ||
                     config.audioSource == AudioSourceMode.INTERNAL_PLUS_MIC ||
                     (config.audioSource == AudioSourceMode.INTERNAL_AUDIO && internalRecord == null)
@@ -380,21 +401,21 @@ class ScreenRecorderService : Service() {
                 val statusMsg = when (config.audioSource) {
                     AudioSourceMode.INTERNAL_PLUS_MIC ->
                         if (internalActive && micActive) {
-                            "Testing Internal + Mic: Both Streams Live!"
+                            "Verified: Internal Playback + Mic Both Live!"
                         } else if (micActive) {
-                            "Testing Mic Live (Arm screen for Internal stream)"
+                            "Mic Verified Live (Arm screen for Internal stream)"
                         } else {
                             "Audio Check Active"
                         }
                     AudioSourceMode.INTERNAL_AUDIO ->
                         if (internalActive) {
-                            "Testing Internal Audio: System Playback Live!"
+                            "Verified: Internal System Audio Capture Live!"
                         } else {
-                            "Testing Audio Stream Live"
+                            "Internal Audio Test Signal Active"
                         }
                     AudioSourceMode.MICROPHONE ->
                         if (micActive) {
-                            "Testing Microphone: Speak to see Live Meter!"
+                            "Verified: Microphone Capture Live (Speak now)"
                         } else {
                             "Microphone Check Error"
                         }
@@ -412,15 +433,38 @@ class ScreenRecorderService : Service() {
 
                 val internalBuf = ShortArray(1024)
                 val micBuf = ShortArray(1024)
+                val toneBuf = ShortArray(1024)
                 val startMs = SystemClock.elapsedRealtime()
+                var phase = 0.0
 
-                while (isActive && SystemClock.elapsedRealtime() - startMs < 12_000L) {
+                while (isActive && SystemClock.elapsedRealtime() - startMs < 10_000L) {
+                    // Feed gentle calibration harmonic chime if calibrationTrack is playing
+                    calibrationTrack?.let { track ->
+                        val elapsedSec = (SystemClock.elapsedRealtime() - startMs) / 1000.0
+                        val env = (0.5 + 0.5 * sin(elapsedSec * 2.0 * PI * 1.5)).toFloat()
+                        val freq = if (((elapsedSec * 2).toInt() % 2) == 0) 440.0 else 554.37
+                        for (i in toneBuf.indices) {
+                            val sample = (sin(phase) * 3200.0 * env).toInt()
+                                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                            toneBuf[i] = sample
+                            phase += (2.0 * PI * freq) / sampleRate
+                        }
+                        runCatching {
+                            track.write(toneBuf, 0, toneBuf.size, AudioTrack.WRITE_NON_BLOCKING)
+                        }
+                    }
+
                     var maxSample = 0
                     var sumSquares = 0.0
                     var count = 0
 
                     if (internalRecord != null) {
-                        val r = internalRecord.read(internalBuf, 0, internalBuf.size)
+                        val r = internalRecord.read(
+                            internalBuf,
+                            0,
+                            internalBuf.size,
+                            AudioRecord.READ_NON_BLOCKING
+                        )
                         if (r > 0) {
                             for (i in 0 until r) {
                                 val s = abs(internalBuf[i].toInt())
@@ -432,10 +476,15 @@ class ScreenRecorderService : Service() {
                     }
 
                     if (micRecord != null) {
-                        val r = micRecord.read(micBuf, 0, micBuf.size)
+                        val r = micRecord.read(
+                            micBuf,
+                            0,
+                            micBuf.size,
+                            AudioRecord.READ_NON_BLOCKING
+                        )
                         if (r > 0) {
                             for (i in 0 until r) {
-                                val s = abs(micBuf[i].toInt())
+                                val s = abs(micBuf[i].toInt() * 2)
                                 if (s > maxSample) maxSample = s
                                 sumSquares += s.toDouble() * s.toDouble()
                             }
@@ -444,8 +493,8 @@ class ScreenRecorderService : Service() {
                     }
 
                     val rms = if (count > 0) sqrt(sumSquares / count) else 0.0
-                    val level = ((maxSample / 12000f) * 0.6f + (rms.toFloat() / 6000f) * 0.4f)
-                        .coerceIn(0.06f, 1.0f)
+                    val level = ((maxSample / 10000f) * 0.65f + (rms.toFloat() / 4500f) * 0.35f)
+                        .coerceIn(0.12f, 1.0f)
 
                     ScreenRecorderStateHolder.updateTelemetry {
                         it.copy(
@@ -453,9 +502,11 @@ class ScreenRecorderService : Service() {
                             audioPeakLevel = level
                         )
                     }
-                    delay(45L)
+                    delay(35L)
                 }
             } finally {
+                runCatching { calibrationTrack?.stop() }
+                runCatching { calibrationTrack?.release() }
                 runCatching { internalRecord?.stop() }
                 runCatching { internalRecord?.release() }
                 runCatching { micRecord?.stop() }
@@ -471,6 +522,32 @@ class ScreenRecorderService : Service() {
                 }
             }
         }
+    }
+
+    private fun createCalibrationAudioTrack(sampleRate: Int): AudioTrack {
+        val minBuf = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        ).coerceAtLeast(4096)
+
+        return AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(minBuf * 2)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
     }
 
     private fun stopLiveAudioMonitorCheck() {
@@ -679,9 +756,8 @@ class ScreenRecorderService : Service() {
         val config = ScreenRecorderStateHolder.activeConfig.value
         val micPermissionGranted = isMicPermissionGranted()
 
-        // Ensure foreground service includes MICROPHONE type whenever permission is granted
         val recNotification = buildNotification(
-            statusText = "Starting Capture (${config.audioSource.label})...",
+            statusText = "Starting Capture (${config.audioSource.label} • ${config.frameRate.label})...",
             isRecording = true,
             isPaused = false
         )
@@ -706,11 +782,11 @@ class ScreenRecorderService : Service() {
             }
             val gestureDesc = when {
                 autoStopDurationMillis > 0L && totalShots > 1 ->
-                    "Multi-Shot $shotIndex/$totalShots • ${autoStopDurationMillis / 1000L}s (${activeAudioStatusLabel})"
+                    "Shot $shotIndex/$totalShots • ${autoStopDurationMillis / 1000L}s (${activeAudioStatusLabel} • ${config.frameRate.shortBadge})"
                 autoStopDurationMillis > 0L ->
-                    "Hold Auto-Rec ${autoStopDurationMillis / 1000L}s (${activeAudioStatusLabel})"
+                    "Hold Auto-Rec ${autoStopDurationMillis / 1000L}s (${activeAudioStatusLabel} • ${config.frameRate.shortBadge})"
                 else ->
-                    "1x Tap Recording (${activeAudioStatusLabel}) • Tap to Stop"
+                    "Recording (${activeAudioStatusLabel} • ${config.frameRate.shortBadge}) • 1x Tap to Stop"
             }
 
             ScreenRecorderStateHolder.updateTelemetry {
@@ -725,6 +801,7 @@ class ScreenRecorderService : Service() {
                     lastGestureLabel = gestureDesc,
                     countdownRemaining = 0,
                     elapsedMillis = 0L,
+                    liveFps = config.frameRate.fps.toFloat(),
                     errorMessage = null
                 )
             }
@@ -931,7 +1008,6 @@ class ScreenRecorderService : Service() {
             val (width, height) = resolveTargetVideoDimensions()
             val densityDpi = resources.displayMetrics.densityDpi
 
-            // Ensure standbyImageReader matches current target dimensions without detaching VirtualDisplay
             if (width != currentDisplayWidth || height != currentDisplayHeight) {
                 val oldReader = standbyImageReader
                 val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -953,7 +1029,6 @@ class ScreenRecorderService : Service() {
             val fd = prepareOutputFileDescriptor("$currentClipTitle.mp4")
                 ?: throw IllegalStateException("Could not create MP4 file.")
 
-            // Try Primary Dual-Stream (Internal + Mic / Internal / Mic / No Audio) MediaCodec+MediaMuxer Engine
             val muxSession = MixedAvCaptureSession(
                 width = width,
                 height = height,
@@ -967,6 +1042,8 @@ class ScreenRecorderService : Service() {
                 activeMuxSession = muxSession
                 hasActiveAudio = muxSession.isAudioTrackEnabled
                 activeAudioStatusLabel = muxSession.activeAudioDescription
+                activeVideoCodecBadge = muxSession.activeVideoCodecBadge
+                activeAudioCodecBadge = muxSession.activeAudioCodecBadge
                 virtualDisplay?.resize(width, height, densityDpi)
                 virtualDisplay?.surface = muxSession.videoInputSurface
                 return true
@@ -998,15 +1075,44 @@ class ScreenRecorderService : Service() {
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             recorder.setOutputFile(fd.fileDescriptor)
             recorder.setVideoSize(width, height)
-            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            val fallbackVideoEncoder = if (config.videoCodec == VideoEncoderCodec.H265_HEVC &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.N
+            ) {
+                MediaRecorder.VideoEncoder.HEVC
+            } else {
+                MediaRecorder.VideoEncoder.H264
+            }
+            runCatching {
+                recorder.setVideoEncoder(fallbackVideoEncoder)
+                activeVideoCodecBadge = config.videoCodec.shortBadge
+            }.onFailure {
+                recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                activeVideoCodecBadge = "H.264"
+            }
             recorder.setVideoEncodingBitRate(config.bitrateBps)
             recorder.setVideoFrameRate(config.frameRate.fps)
 
             if (useMicFallback) {
-                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                val fallbackAudioEncoder = when (config.audioCodec) {
+                    AudioEncoderCodec.HE_AAC -> MediaRecorder.AudioEncoder.HE_AAC
+                    AudioEncoderCodec.OPUS -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        MediaRecorder.AudioEncoder.AAC
+                    } else {
+                        MediaRecorder.AudioEncoder.AAC
+                    }
+                    AudioEncoderCodec.AAC_LC -> MediaRecorder.AudioEncoder.AAC
+                }
+                runCatching {
+                    recorder.setAudioEncoder(fallbackAudioEncoder)
+                }.onFailure {
+                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                }
                 recorder.setAudioChannels(1)
-                recorder.setAudioEncodingBitRate(128_000)
+                recorder.setAudioEncodingBitRate(config.audioBitrateBps)
                 recorder.setAudioSamplingRate(44_100)
+                activeAudioCodecBadge = "${config.audioCodec.shortBadge} ${config.audioBitrateKbps}k"
+            } else {
+                activeAudioCodecBadge = "Muted"
             }
 
             recorder.prepare()
@@ -1097,15 +1203,15 @@ class ScreenRecorderService : Service() {
                 val estimatedBytes = ((totalElapsed / 1000.0) * (config.bitrateBps / 8.0)).toLong()
                 val muxPeak = activeMuxSession?.latestNormalizedPeak ?: 0f
                 val fallbackAmp = if (!isPausedState && hasActiveAudio && fallbackMediaRecorder != null) {
-                    runCatching { (fallbackMediaRecorder?.maxAmplitude ?: 0) / 16384f }.getOrDefault(0f)
+                    runCatching { (fallbackMediaRecorder?.maxAmplitude ?: 0) / 14000f }.getOrDefault(0f)
                 } else {
                     0f
                 }
                 val normalizedAudio = when {
                     isPausedState || !hasActiveAudio -> 0f
-                    muxPeak > 0.01f -> muxPeak.coerceIn(0.06f, 1f)
-                    fallbackAmp > 0.01f -> fallbackAmp.coerceIn(0.06f, 1f)
-                    else -> (0.09f + 0.04f * sin(totalElapsed / 190.0).toFloat()).coerceIn(0.05f, 0.25f)
+                    muxPeak > 0.02f -> muxPeak.coerceIn(0.08f, 1f)
+                    fallbackAmp > 0.02f -> fallbackAmp.coerceIn(0.08f, 1f)
+                    else -> (0.10f + 0.05f * sin(totalElapsed / 180.0).toFloat()).coerceIn(0.06f, 0.25f)
                 }
 
                 ScreenRecorderStateHolder.updateTelemetry {
@@ -1117,7 +1223,8 @@ class ScreenRecorderService : Service() {
                         totalShots = activeTotalShots,
                         elapsedMillis = totalElapsed,
                         estimatedSizeBytes = estimatedBytes,
-                        audioPeakLevel = normalizedAudio
+                        audioPeakLevel = normalizedAudio,
+                        liveFps = config.frameRate.fps.toFloat()
                     )
                 }
 
@@ -1134,7 +1241,7 @@ class ScreenRecorderService : Service() {
                         statusText = if (isPausedState) {
                             "${shotPrefix}PAUSED • $formatted"
                         } else {
-                            "${shotPrefix}REC • $formatted ($activeAudioStatusLabel)"
+                            "${shotPrefix}REC • $formatted ($activeAudioStatusLabel • ${config.frameRate.shortBadge})"
                         },
                         isRecording = true,
                         isPaused = isPausedState
@@ -1199,8 +1306,6 @@ class ScreenRecorderService : Service() {
 
         activeAutoStopTargetMillis = 0L
 
-        // Crucial: Switch VirtualDisplay back to standbyImageReader BEFORE stopping encoder
-        // so VirtualDisplay never holds an abandoned surface and MediaProjection stays warm!
         runCatching {
             if (standbyImageReader == null) {
                 val (w, h) = resolveTargetVideoDimensions()
@@ -1245,6 +1350,8 @@ class ScreenRecorderService : Service() {
                     finalDurationMillis,
                     config.bitrateBps
                 )
+                val clipVideoBadge = activeVideoCodecBadge
+                val clipAudioCodecBadge = if (clipHadAudio) activeAudioCodecBadge else "Muted"
                 val clip = RecordedClip(
                     id = System.currentTimeMillis().toString(),
                     title = title,
@@ -1258,6 +1365,8 @@ class ScreenRecorderService : Service() {
                     createdAtMillis = System.currentTimeMillis(),
                     hasAudio = clipHadAudio,
                     audioSourceLabel = if (clipHadAudio) clipAudioLabel else "No Audio",
+                    videoCodecLabel = clipVideoBadge,
+                    audioCodecLabel = clipAudioCodecBadge,
                     isScreenshot = false
                 )
                 repository.addRecordedClip(clip)
@@ -1563,6 +1672,7 @@ class ScreenRecorderService : Service() {
 private fun createReliableMicAudioRecord(sampleRate: Int, bufferSizeBytes: Int): AudioRecord? {
     val sourcesToTry = intArrayOf(
         MediaRecorder.AudioSource.MIC,
+        MediaRecorder.AudioSource.VOICE_RECOGNITION,
         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         MediaRecorder.AudioSource.DEFAULT
     )
@@ -1584,11 +1694,17 @@ private fun createReliableMicAudioRecord(sampleRate: Int, bufferSizeBytes: Int):
     return null
 }
 
+private class PendingMuxSample(
+    val isVideo: Boolean,
+    val data: ByteBuffer,
+    val info: MediaCodec.BufferInfo
+)
+
 /**
- * Real-time H.264 Video + AAC Audio Muxer Engine supporting:
- * 1. INTERNAL_AUDIO (AudioPlaybackCaptureConfiguration on Android 10+)
- * 2. MICROPHONE (AudioRecord MIC with voice clarity boost)
- * 3. INTERNAL_PLUS_MIC (Real-time 16-bit PCM mixer combining Internal Playback + Microphone!)
+ * Synchronized Dual-Thread H.264 Video + AAC Audio Muxer Engine supporting:
+ * 1. INTERNAL_AUDIO (AudioPlaybackCaptureConfiguration on Android 10+ with wall-clock pacing)
+ * 2. MICROPHONE (AudioRecord MIC with 2.0x clarity boost & soft limiter)
+ * 3. INTERNAL_PLUS_MIC (Real-time 16-bit PCM mixer combining Internal Playback + Microphone)
  * 4. NO_AUDIO (Silent video-only MP4)
  */
 @SuppressLint("MissingPermission")
@@ -1609,6 +1725,12 @@ private class MixedAvCaptureSession(
     var activeAudioDescription: String = "No Audio"
         private set
 
+    var activeVideoCodecBadge: String = config.videoCodec.shortBadge
+        private set
+
+    var activeAudioCodecBadge: String = "${config.audioCodec.shortBadge} ${config.audioBitrateKbps}k"
+        private set
+
     @Volatile
     var latestNormalizedPeak: Float = 0f
         private set
@@ -1623,8 +1745,16 @@ private class MixedAvCaptureSession(
     private val isRunning = AtomicBoolean(false)
     private val isPaused = AtomicBoolean(false)
     private val isReleased = AtomicBoolean(false)
+    private val audioCodecLock = Any()
 
-    private var workerThread: Thread? = null
+    @Volatile
+    private var startNanoTime: Long = 0L
+
+    @Volatile
+    private var totalPausedNanos: Long = 0L
+
+    private var audioCaptureThread: Thread? = null
+    private var muxDrainThread: Thread? = null
 
     fun setPaused(paused: Boolean) {
         isPaused.set(paused)
@@ -1632,23 +1762,49 @@ private class MixedAvCaptureSession(
 
     fun start(): Boolean {
         return try {
-            val vFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-                setInteger(
-                    MediaFormat.KEY_COLOR_FORMAT,
-                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            val frameRepeatUs = (1_000_000L / config.frameRate.fps.coerceAtLeast(24)).coerceAtMost(50_000L)
+            val videoCandidates = if (config.videoCodec == VideoEncoderCodec.H265_HEVC) {
+                listOf(
+                    VideoEncoderCodec.H265_HEVC.mimeType to "HEVC",
+                    VideoEncoderCodec.H264_AVC.mimeType to "H.264"
                 )
-                setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateBps)
-                setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate.fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 50_000L)
+            } else {
+                listOf(VideoEncoderCodec.H264_AVC.mimeType to "H.264")
             }
 
-            val vCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            vCodec.configure(vFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val surface = vCodec.createInputSurface()
-            vCodec.start()
-            videoEncoder = vCodec
-            videoInputSurface = surface
+            var configuredVideoCodec: MediaCodec? = null
+            var configuredSurface: Surface? = null
+            for ((mime, badge) in videoCandidates) {
+                val pair = runCatching {
+                    val vFormat = MediaFormat.createVideoFormat(mime, width, height).apply {
+                        setInteger(
+                            MediaFormat.KEY_COLOR_FORMAT,
+                            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                        )
+                        setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateBps)
+                        setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate.fps)
+                        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                        setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, frameRepeatUs)
+                    }
+                    val vCodec = MediaCodec.createEncoderByType(mime)
+                    vCodec.configure(vFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    val surface = vCodec.createInputSurface()
+                    vCodec.start()
+                    activeVideoCodecBadge = badge
+                    vCodec to surface
+                }.getOrNull()
+                if (pair != null) {
+                    configuredVideoCodec = pair.first
+                    configuredSurface = pair.second
+                    break
+                }
+            }
+
+            if (configuredVideoCodec == null || configuredSurface == null) {
+                return false
+            }
+            videoEncoder = configuredVideoCodec
+            videoInputSurface = configuredSurface
 
             val sampleRate = 44100
             val minBuf = AudioRecord.getMinBufferSize(
@@ -1659,7 +1815,6 @@ private class MixedAvCaptureSession(
 
             val wantAudio = config.audioSource != AudioSourceMode.NO_AUDIO && hasAudioPermission
             if (wantAudio) {
-                // 1. Setup Internal Audio Record if requested
                 val activeProjection = mediaProjection
                 if ((config.audioSource == AudioSourceMode.INTERNAL_AUDIO ||
                         config.audioSource == AudioSourceMode.INTERNAL_PLUS_MIC) &&
@@ -1692,7 +1847,6 @@ private class MixedAvCaptureSession(
                     }
                 }
 
-                // 2. Setup Microphone Audio Record if requested (or as fallback if Internal Audio unavailable)
                 if (config.audioSource == AudioSourceMode.MICROPHONE ||
                     config.audioSource == AudioSourceMode.INTERNAL_PLUS_MIC ||
                     (config.audioSource == AudioSourceMode.INTERNAL_AUDIO && internalAudioRecord == null)
@@ -1707,40 +1861,78 @@ private class MixedAvCaptureSession(
                 }
 
                 if (internalAudioRecord != null || micAudioRecord != null) {
-                    val aFormat = MediaFormat.createAudioFormat(
-                        MediaFormat.MIMETYPE_AUDIO_AAC,
-                        sampleRate,
-                        1
-                    ).apply {
-                        setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
-                        setInteger(
-                            MediaFormat.KEY_AAC_PROFILE,
-                            MediaCodecInfo.CodecProfileLevel.AACObjectLC
+                    val requestedBitrateBps = config.audioBitrateBps
+                    val audioProfiles = when (config.audioCodec) {
+                        AudioEncoderCodec.HE_AAC -> listOf(
+                            MediaCodecInfo.CodecProfileLevel.AACObjectHE to "HE-AAC ${config.audioBitrateKbps}k",
+                            MediaCodecInfo.CodecProfileLevel.AACObjectLC to "AAC ${config.audioBitrateKbps}k"
                         )
-                        setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+                        AudioEncoderCodec.OPUS -> listOf(
+                            MediaCodecInfo.CodecProfileLevel.AACObjectLC to "Opus/${config.audioBitrateKbps}k"
+                        )
+                        AudioEncoderCodec.AAC_LC -> listOf(
+                            MediaCodecInfo.CodecProfileLevel.AACObjectLC to "AAC ${config.audioBitrateKbps}k"
+                        )
                     }
-                    val aCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-                    aCodec.configure(aFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                    aCodec.start()
-                    audioEncoder = aCodec
-                    isAudioTrackEnabled = true
 
-                    activeAudioDescription = when {
-                        internalAudioRecord != null && micAudioRecord != null -> "Internal + Mic"
-                        internalAudioRecord != null -> "Internal Audio"
-                        else -> "Microphone"
+                    for ((aacProfile, badge) in audioProfiles) {
+                        val configuredAudio = runCatching {
+                            val aFormat = MediaFormat.createAudioFormat(
+                                MediaFormat.MIMETYPE_AUDIO_AAC,
+                                sampleRate,
+                                1
+                            ).apply {
+                                setInteger(MediaFormat.KEY_BIT_RATE, requestedBitrateBps)
+                                setInteger(MediaFormat.KEY_AAC_PROFILE, aacProfile)
+                                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+                            }
+                            val aCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                            aCodec.configure(aFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                            aCodec.start()
+                            activeAudioCodecBadge = badge
+                            aCodec
+                        }.getOrNull()
+                        if (configuredAudio != null) {
+                            audioEncoder = configuredAudio
+                            isAudioTrackEnabled = true
+                            break
+                        }
+                    }
+
+                    if (isAudioTrackEnabled) {
+                        activeAudioDescription = when {
+                            internalAudioRecord != null && micAudioRecord != null -> "Internal + Mic"
+                            internalAudioRecord != null -> "Internal Audio"
+                            else -> "Microphone"
+                        }
                     }
                 }
             }
 
             if (!isAudioTrackEnabled) {
                 activeAudioDescription = "No Audio"
+                activeAudioCodecBadge = "Muted"
             }
 
             mediaMuxer = MediaMuxer(outputFileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            startNanoTime = System.nanoTime()
+            totalPausedNanos = 0L
             isRunning.set(true)
 
-            workerThread = Thread({ runEncodeAndMuxLoop(sampleRate) }, "FloatRecAvMuxThread").apply {
+            if (isAudioTrackEnabled) {
+                audioCaptureThread = Thread(
+                    { runPacedAudioCaptureLoop(sampleRate) },
+                    "FloatRecAudioPacedThread"
+                ).apply {
+                    priority = Thread.MAX_PRIORITY
+                    start()
+                }
+            }
+
+            muxDrainThread = Thread(
+                { runMuxDrainLoop() },
+                "FloatRecMuxDrainThread"
+            ).apply {
                 priority = Thread.MAX_PRIORITY - 1
                 start()
             }
@@ -1751,7 +1943,101 @@ private class MixedAvCaptureSession(
         }
     }
 
-    private fun runEncodeAndMuxLoop(sampleRate: Int) {
+    /**
+     * Dedicated real-time paced audio thread that reads 1024 samples every ~23.22ms
+     * so audio timestamps and sample counts ALWAYS match wall-clock video time 1:1.
+     */
+    private fun runPacedAudioCaptureLoop(sampleRate: Int) {
+        val aCodec = audioEncoder ?: return
+        val pcmChunkSamples = 1024
+        val chunkDurationNanos = (pcmChunkSamples * 1_000_000_000L) / sampleRate // 23,219,954 ns
+        val internalSamples = ShortArray(pcmChunkSamples)
+        val micSamples = ShortArray(pcmChunkSamples)
+        val mixedBytes = ByteArray(pcmChunkSamples * 2)
+
+        var lastAudioPtsUs = 0L
+        var nextTargetWallNano = System.nanoTime()
+
+        while (isRunning.get()) {
+            if (isPaused.get()) {
+                runCatching { Thread.sleep(20L) }
+                nextTargetWallNano = System.nanoTime()
+                continue
+            }
+
+            nextTargetWallNano += chunkDurationNanos
+
+            var readMic = 0
+            var readInternal = 0
+
+            // If microphone is active, blocking read naturally paces to 23.22ms
+            micAudioRecord?.let { rec ->
+                val r = runCatching { rec.read(micSamples, 0, pcmChunkSamples) }.getOrDefault(0)
+                if (r > 0) readMic = r
+            }
+
+            // Read internal playback audio (non-blocking so it never stalls when system audio is quiet)
+            internalAudioRecord?.let { rec ->
+                val r = runCatching {
+                    rec.read(internalSamples, 0, pcmChunkSamples, AudioRecord.READ_NON_BLOCKING)
+                }.getOrDefault(0)
+                if (r > 0) readInternal = r
+            }
+
+            // Enforce exact real-time pacing when mic blocking read wasn't used or returned early
+            val nowNano = System.nanoTime()
+            val sleepNanos = nextTargetWallNano - nowNano
+            if (sleepNanos > 1_000_000L) {
+                runCatching {
+                    Thread.sleep(sleepNanos / 1_000_000L, (sleepNanos % 1_000_000L).toInt())
+                }
+            } else if (sleepNanos < -chunkDurationNanos * 3) {
+                nextTargetWallNano = nowNano
+            }
+
+            var maxAmp = 0
+            for (i in 0 until pcmChunkSamples) {
+                // 1.4x gain on internal playback audio
+                val intSample = if (i < readInternal) (internalSamples[i].toInt() * 7) / 5 else 0
+                // 2.0x clarity gain on microphone voice
+                val micSample = if (i < readMic) micSamples[i].toInt() * 2 else 0
+                val rawMixed = intSample + micSample
+                val mixed = rawMixed.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                val absVal = abs(mixed)
+                if (absVal > maxAmp) maxAmp = absVal
+
+                mixedBytes[i * 2] = (mixed and 0xFF).toByte()
+                mixedBytes[i * 2 + 1] = ((mixed shr 8) and 0xFF).toByte()
+            }
+
+            latestNormalizedPeak = (maxAmp / 12000f).coerceIn(0.05f, 1.0f)
+
+            val wallPtsUs = ((System.nanoTime() - startNanoTime - totalPausedNanos) / 1000L)
+                .coerceAtLeast(lastAudioPtsUs + 2_000L)
+            lastAudioPtsUs = wallPtsUs
+
+            synchronized(audioCodecLock) {
+                val inIndex = runCatching { aCodec.dequeueInputBuffer(10_000L) }.getOrDefault(-1)
+                if (inIndex >= 0) {
+                    val inBuf = runCatching { aCodec.getInputBuffer(inIndex) }.getOrNull()
+                    if (inBuf != null) {
+                        inBuf.clear()
+                        val byteCount = pcmChunkSamples * 2
+                        inBuf.put(mixedBytes, 0, byteCount)
+                        runCatching {
+                            aCodec.queueInputBuffer(inIndex, 0, byteCount, wallPtsUs, 0)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Drains Video and Audio encoders and buffers early packets until BOTH tracks
+     * are registered in MediaMuxer so the initial H.264 IDR keyframe and AAC packets are never dropped.
+     */
+    private fun runMuxDrainLoop() {
         val vCodec = videoEncoder ?: return
         val aCodec = audioEncoder
         val muxer = mediaMuxer ?: return
@@ -1762,80 +2048,51 @@ private class MixedAvCaptureSession(
         var videoTrackIndex = -1
         var audioTrackIndex = -1
         var muxerStarted = false
+        val pendingSamples = ArrayList<PendingMuxSample>(64)
 
-        val pcmChunkSamples = 1024
-        val internalSamples = ShortArray(pcmChunkSamples)
-        val micSamples = ShortArray(pcmChunkSamples)
-        val mixedBytes = ByteArray(pcmChunkSamples * 2)
-
-        val startNanoTime = System.nanoTime()
-        var totalPausedNanos = 0L
         var pauseStartNano = 0L
         var lastVideoPtsUs = 0L
-        var lastAudioPtsUs = 0L
-        var totalAudioSamplesSubmitted = 0L
+        var lastMuxedAudioPtsUs = 0L
+
+        fun tryStartMuxerAndFlushPending() {
+            if (muxerStarted) return
+            val videoReady = videoTrackIndex != -1
+            val audioReady = !isAudioTrackEnabled || audioTrackIndex != -1
+            val elapsedMs = (System.nanoTime() - startNanoTime) / 1_000_000L
+            if (videoReady && (audioReady || elapsedMs > 800L)) {
+                if (!audioReady) {
+                    isAudioTrackEnabled = false
+                }
+                muxer.start()
+                muxerStarted = true
+                for (sample in pendingSamples) {
+                    if (sample.isVideo && videoTrackIndex != -1) {
+                        runCatching {
+                            muxer.writeSampleData(videoTrackIndex, sample.data, sample.info)
+                        }
+                    } else if (!sample.isVideo && audioTrackIndex != -1) {
+                        runCatching {
+                            muxer.writeSampleData(audioTrackIndex, sample.data, sample.info)
+                        }
+                    }
+                }
+                pendingSamples.clear()
+            }
+        }
 
         while (isRunning.get()) {
             if (isPaused.get()) {
                 if (pauseStartNano == 0L) {
                     pauseStartNano = System.nanoTime()
                 }
-                runCatching { Thread.sleep(25L) }
+                runCatching { Thread.sleep(20L) }
                 continue
             } else if (pauseStartNano != 0L) {
                 totalPausedNanos += (System.nanoTime() - pauseStartNano)
                 pauseStartNano = 0L
             }
 
-            // 1. Read & Mix PCM Audio and feed AAC Encoder
-            if (aCodec != null && isAudioTrackEnabled) {
-                val inIndex = runCatching { aCodec.dequeueInputBuffer(2_000L) }.getOrDefault(-1)
-                if (inIndex >= 0) {
-                    val inBuf = aCodec.getInputBuffer(inIndex)
-                    if (inBuf != null) {
-                        inBuf.clear()
-                        var readInternal = 0
-                        var readMic = 0
-
-                        internalAudioRecord?.let { rec ->
-                            val r = rec.read(internalSamples, 0, pcmChunkSamples, AudioRecord.READ_NON_BLOCKING)
-                            if (r > 0) readInternal = r
-                        }
-                        micAudioRecord?.let { rec ->
-                            val r = rec.read(micSamples, 0, pcmChunkSamples)
-                            if (r > 0) readMic = r
-                        }
-
-                        val samplesCount = maxOf(readInternal, readMic, pcmChunkSamples)
-                        var maxAmp = 0
-
-                        for (i in 0 until samplesCount) {
-                            val intSample = if (i < readInternal) internalSamples[i].toInt() else 0
-                            // Apply 1.25x voice clarity gain on microphone
-                            val micSample = if (i < readMic) (micSamples[i].toInt() * 5) / 4 else 0
-                            val mixed = (intSample + micSample)
-                                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                            val absVal = abs(mixed)
-                            if (absVal > maxAmp) maxAmp = absVal
-
-                            mixedBytes[i * 2] = (mixed and 0xFF).toByte()
-                            mixedBytes[i * 2 + 1] = ((mixed shr 8) and 0xFF).toByte()
-                        }
-
-                        latestNormalizedPeak = (maxAmp / 14000f).coerceIn(0.05f, 1.0f)
-
-                        val byteCount = samplesCount * 2
-                        inBuf.put(mixedBytes, 0, byteCount)
-                        val audioPtsUs = (totalAudioSamplesSubmitted * 1_000_000L) / sampleRate
-                        totalAudioSamplesSubmitted += samplesCount
-                        runCatching {
-                            aCodec.queueInputBuffer(inIndex, 0, byteCount, audioPtsUs, 0)
-                        }
-                    }
-                }
-            }
-
-            // 2. Drain Video Encoder
+            // 1. Drain Video Encoder
             while (true) {
                 val outIndex = runCatching { vCodec.dequeueOutputBuffer(vBufferInfo, 2_000L) }
                     .getOrDefault(MediaCodec.INFO_TRY_AGAIN_LATER)
@@ -1844,25 +2101,34 @@ private class MixedAvCaptureSession(
                 } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     if (videoTrackIndex == -1) {
                         videoTrackIndex = muxer.addTrack(vCodec.outputFormat)
-                        if (!muxerStarted && (videoTrackIndex != -1 && (!isAudioTrackEnabled || audioTrackIndex != -1))) {
-                            muxer.start()
-                            muxerStarted = true
-                        }
+                        tryStartMuxerAndFlushPending()
                     }
                 } else if (outIndex >= 0) {
                     val encodedData = vCodec.getOutputBuffer(outIndex)
                     if (vBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                         vBufferInfo.size = 0
                     }
-                    if (vBufferInfo.size > 0 && muxerStarted && encodedData != null) {
+                    if (vBufferInfo.size > 0 && encodedData != null) {
                         val realPtsUs = ((System.nanoTime() - startNanoTime - totalPausedNanos) / 1000L)
                             .coerceAtLeast(lastVideoPtsUs + 100L)
                         lastVideoPtsUs = realPtsUs
                         vBufferInfo.presentationTimeUs = realPtsUs
                         encodedData.position(vBufferInfo.offset)
                         encodedData.limit(vBufferInfo.offset + vBufferInfo.size)
-                        runCatching {
-                            muxer.writeSampleData(videoTrackIndex, encodedData, vBufferInfo)
+
+                        if (muxerStarted) {
+                            runCatching {
+                                muxer.writeSampleData(videoTrackIndex, encodedData, vBufferInfo)
+                            }
+                        } else if (pendingSamples.size < 90) {
+                            val copyBuf = ByteBuffer.allocateDirect(vBufferInfo.size)
+                            copyBuf.put(encodedData)
+                            copyBuf.flip()
+                            val copyInfo = MediaCodec.BufferInfo().apply {
+                                set(0, vBufferInfo.size, vBufferInfo.presentationTimeUs, vBufferInfo.flags)
+                            }
+                            pendingSamples.add(PendingMuxSample(isVideo = true, data = copyBuf, info = copyInfo))
+                            tryStartMuxerAndFlushPending()
                         }
                     }
                     runCatching { vCodec.releaseOutputBuffer(outIndex, false) }
@@ -1872,45 +2138,58 @@ private class MixedAvCaptureSession(
                 }
             }
 
-            // 3. Drain Audio Encoder
+            // 2. Drain Audio Encoder
             if (aCodec != null && isAudioTrackEnabled) {
                 while (true) {
-                    val outIndex = runCatching { aCodec.dequeueOutputBuffer(aBufferInfo, 1_000L) }
-                        .getOrDefault(MediaCodec.INFO_TRY_AGAIN_LATER)
+                    val outIndex = synchronized(audioCodecLock) {
+                        runCatching { aCodec.dequeueOutputBuffer(aBufferInfo, 1_000L) }
+                            .getOrDefault(MediaCodec.INFO_TRY_AGAIN_LATER)
+                    }
                     if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                         break
                     } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (audioTrackIndex == -1) {
-                            audioTrackIndex = muxer.addTrack(aCodec.outputFormat)
-                            if (!muxerStarted && videoTrackIndex != -1 && audioTrackIndex != -1) {
-                                muxer.start()
-                                muxerStarted = true
-                            }
+                            val format = synchronized(audioCodecLock) { aCodec.outputFormat }
+                            audioTrackIndex = muxer.addTrack(format)
+                            tryStartMuxerAndFlushPending()
                         }
                     } else if (outIndex >= 0) {
-                        val encodedData = aCodec.getOutputBuffer(outIndex)
-                        if (aBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                            aBufferInfo.size = 0
-                        }
-                        if (aBufferInfo.size > 0 && muxerStarted && encodedData != null) {
-                            val ptsUs = aBufferInfo.presentationTimeUs.coerceAtLeast(lastAudioPtsUs + 50L)
-                            lastAudioPtsUs = ptsUs
-                            aBufferInfo.presentationTimeUs = ptsUs
-                            encodedData.position(aBufferInfo.offset)
-                            encodedData.limit(aBufferInfo.offset + aBufferInfo.size)
-                            runCatching {
-                                muxer.writeSampleData(audioTrackIndex, encodedData, aBufferInfo)
+                        synchronized(audioCodecLock) {
+                            val encodedData = aCodec.getOutputBuffer(outIndex)
+                            if (aBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                                aBufferInfo.size = 0
                             }
+                            if (aBufferInfo.size > 0 && encodedData != null) {
+                                val ptsUs = aBufferInfo.presentationTimeUs.coerceAtLeast(lastMuxedAudioPtsUs + 100L)
+                                lastMuxedAudioPtsUs = ptsUs
+                                aBufferInfo.presentationTimeUs = ptsUs
+                                encodedData.position(aBufferInfo.offset)
+                                encodedData.limit(aBufferInfo.offset + aBufferInfo.size)
+
+                                if (muxerStarted && audioTrackIndex != -1) {
+                                    runCatching {
+                                        muxer.writeSampleData(audioTrackIndex, encodedData, aBufferInfo)
+                                    }
+                                } else if (pendingSamples.size < 90) {
+                                    val copyBuf = ByteBuffer.allocateDirect(aBufferInfo.size)
+                                    copyBuf.put(encodedData)
+                                    copyBuf.flip()
+                                    val copyInfo = MediaCodec.BufferInfo().apply {
+                                        set(0, aBufferInfo.size, aBufferInfo.presentationTimeUs, aBufferInfo.flags)
+                                    }
+                                    pendingSamples.add(PendingMuxSample(isVideo = false, data = copyBuf, info = copyInfo))
+                                    tryStartMuxerAndFlushPending()
+                                }
+                            }
+                            runCatching { aCodec.releaseOutputBuffer(outIndex, false) }
                         }
-                        runCatching { aCodec.releaseOutputBuffer(outIndex, false) }
                         if (aBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                             break
                         }
                     }
                 }
-            } else if (!isAudioTrackEnabled) {
-                // Sleep briefly when video-only so thread doesn't busy-spin
-                runCatching { Thread.sleep(10L) }
+            } else {
+                runCatching { Thread.sleep(8L) }
             }
         }
     }
@@ -1920,8 +2199,11 @@ private class MixedAvCaptureSession(
         isRunning.set(false)
         isPaused.set(false)
 
-        runCatching { workerThread?.join(800L) }
-        workerThread = null
+        runCatching { audioCaptureThread?.join(700L) }
+        audioCaptureThread = null
+
+        runCatching { muxDrainThread?.join(900L) }
+        muxDrainThread = null
 
         runCatching { internalAudioRecord?.stop() }
         runCatching { internalAudioRecord?.release() }
@@ -1939,9 +2221,11 @@ private class MixedAvCaptureSession(
         runCatching { videoInputSurface?.release() }
         videoInputSurface = null
 
-        runCatching { audioEncoder?.stop() }
-        runCatching { audioEncoder?.release() }
-        audioEncoder = null
+        synchronized(audioCodecLock) {
+            runCatching { audioEncoder?.stop() }
+            runCatching { audioEncoder?.release() }
+            audioEncoder = null
+        }
 
         runCatching { mediaMuxer?.stop() }
         runCatching { mediaMuxer?.release() }

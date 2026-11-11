@@ -2,20 +2,26 @@ package com.example.viewmodel
 
 import android.app.Application
 import android.content.Intent
+import android.net.Uri
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.RecorderRepository
+import com.example.model.AudioEncoderCodec
 import com.example.model.AudioSourceMode
 import com.example.model.CaptureFilterTab
+import com.example.model.FrameRatePreset
 import com.example.model.HudPillMode
+import com.example.model.ImportMediaEncoderState
 import com.example.model.RecordedClip
 import com.example.model.RecorderConfig
 import com.example.model.RecorderStatus
 import com.example.model.RecorderSubTab
 import com.example.model.ResolutionPreset
 import com.example.model.SavedRecorderPreset
+import com.example.model.VideoEncoderCodec
 import com.example.service.LiveRecordingTelemetry
+import com.example.service.MediaImportEncoderEngine
 import com.example.service.ScreenRecorderService
 import com.example.service.ScreenRecorderStateHolder
 import kotlin.math.roundToInt
@@ -37,7 +43,8 @@ data class RecorderUiState(
     val saveConfirmationBadge: String? = null,
     val selectedClipForPlayback: RecordedClip? = null,
     val clipToRename: RecordedClip? = null,
-    val recentSavedBannerClip: RecordedClip? = null
+    val recentSavedBannerClip: RecordedClip? = null,
+    val importEncoderState: ImportMediaEncoderState = ImportMediaEncoderState()
 ) {
     val filteredClips: List<RecordedClip>
         get() = when (activeCaptureFilter) {
@@ -57,6 +64,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private val _selectedClipForPlayback = MutableStateFlow<RecordedClip?>(null)
     private val _clipToRename = MutableStateFlow<RecordedClip?>(null)
     private val _recentSavedBannerClip = MutableStateFlow<RecordedClip?>(null)
+    private val _importEncoderState = MutableStateFlow(ImportMediaEncoderState())
 
     private data class UiOverlayState(
         val subTab: RecorderSubTab,
@@ -64,7 +72,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         val saveBadge: String?,
         val selectedClip: RecordedClip?,
         val renameClip: RecordedClip?,
-        val bannerClip: RecordedClip?
+        val bannerClip: RecordedClip?,
+        val importState: ImportMediaEncoderState
     )
 
     private val overlayStateFlow = combine(
@@ -73,15 +82,17 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         },
         combine(_selectedClipForPlayback, _clipToRename, _recentSavedBannerClip) { d, e, f ->
             Triple(d, e, f)
-        }
-    ) { tabs, modals ->
+        },
+        _importEncoderState
+    ) { tabs, modals, importState ->
         UiOverlayState(
             subTab = tabs.first,
             filterTab = tabs.second,
             saveBadge = tabs.third,
             selectedClip = modals.first,
             renameClip = modals.second,
-            bannerClip = modals.third
+            bannerClip = modals.third,
+            importState = importState
         )
     }
 
@@ -103,7 +114,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             saveConfirmationBadge = overlay.saveBadge,
             selectedClipForPlayback = overlay.selectedClip,
             clipToRename = overlay.renameClip,
-            recentSavedBannerClip = overlay.bannerClip
+            recentSavedBannerClip = overlay.bannerClip,
+            importEncoderState = overlay.importState
         )
     }.stateIn(
         scope = viewModelScope,
@@ -132,6 +144,42 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     fun setResolution(preset: ResolutionPreset) {
         updateConfig { it.copy(resolution = preset) }
+    }
+
+    fun setFrameRate(frameRate: FrameRatePreset) {
+        viewModelScope.launch {
+            val updated = uiState.value.config.copy(frameRate = frameRate)
+            ScreenRecorderStateHolder.updateConfig(updated)
+            repository.updateConfig(updated)
+            refreshAudioServiceConfig()
+        }
+    }
+
+    fun setVideoCodec(videoCodec: VideoEncoderCodec) {
+        viewModelScope.launch {
+            val updated = uiState.value.config.copy(videoCodec = videoCodec)
+            ScreenRecorderStateHolder.updateConfig(updated)
+            repository.updateConfig(updated)
+            refreshAudioServiceConfig()
+        }
+    }
+
+    fun setAudioCodec(audioCodec: AudioEncoderCodec) {
+        viewModelScope.launch {
+            val updated = uiState.value.config.copy(audioCodec = audioCodec)
+            ScreenRecorderStateHolder.updateConfig(updated)
+            repository.updateConfig(updated)
+            refreshAudioServiceConfig()
+        }
+    }
+
+    fun setAudioBitrateKbps(kbps: Int) {
+        viewModelScope.launch {
+            val updated = uiState.value.config.copy(audioBitrateKbps = kbps.coerceIn(64, 320))
+            ScreenRecorderStateHolder.updateConfig(updated)
+            repository.updateConfig(updated)
+            refreshAudioServiceConfig()
+        }
     }
 
     fun setBitrateMbps(mbps: Float) {
@@ -189,6 +237,10 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             val updated = uiState.value.config.copy(
                 resolution = preset.resolution,
+                frameRate = preset.frameRate,
+                videoCodec = preset.videoCodec,
+                audioCodec = preset.audioCodec,
+                audioBitrateKbps = preset.audioBitrateKbps,
                 bitrateMbps = preset.bitrateMbps,
                 audioSource = preset.audioSource,
                 autoRecordDurationSeconds = preset.autoRecordDurationSeconds,
@@ -205,6 +257,114 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     fun deleteSavedPreset(presetId: String) {
         viewModelScope.launch {
             repository.deletePreset(presetId)
+        }
+    }
+
+    fun selectImportedVideo(uri: Uri) {
+        val context = getApplication<Application>().applicationContext
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+        viewModelScope.launch {
+            val info = MediaImportEncoderEngine.inspectMediaUri(context, uri)
+            _importEncoderState.value = _importEncoderState.value.copy(
+                selectedVideoUri = uri.toString(),
+                selectedVideoName = info.displayName,
+                selectedVideoDurationMs = info.durationMillis,
+                selectedVideoSizeBytes = info.sizeBytes,
+                statusMessage = "Ready to encode video: ${info.displayName}"
+            )
+        }
+    }
+
+    fun selectImportedAudio(uri: Uri) {
+        val context = getApplication<Application>().applicationContext
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+        viewModelScope.launch {
+            val info = MediaImportEncoderEngine.inspectMediaUri(context, uri)
+            _importEncoderState.value = _importEncoderState.value.copy(
+                selectedAudioUri = uri.toString(),
+                selectedAudioName = info.displayName,
+                selectedAudioDurationMs = info.durationMillis,
+                statusMessage = "Ready to encode audio: ${info.displayName}"
+            )
+        }
+    }
+
+    fun loadExistingClipIntoEncoder(clip: RecordedClip) {
+        if (clip.isScreenshot) return
+        _activeSubTab.value = RecorderSubTab.SAVED_CAPTURES
+        _importEncoderState.value = _importEncoderState.value.copy(
+            selectedVideoUri = clip.uriString,
+            selectedVideoName = "${clip.title}.mp4",
+            selectedVideoDurationMs = clip.durationMillis,
+            selectedVideoSizeBytes = clip.sizeBytes,
+            statusMessage = "Loaded '${clip.title}' • Choose codec & tap Encode"
+        )
+    }
+
+    fun clearImportedMedia() {
+        if (_importEncoderState.value.isEncoding) return
+        _importEncoderState.value = ImportMediaEncoderState()
+    }
+
+    fun runImportAudioVideoEncoder() {
+        val currentImport = _importEncoderState.value
+        if (currentImport.isEncoding) return
+        if (currentImport.selectedVideoUri == null && currentImport.selectedAudioUri == null) {
+            _importEncoderState.value = currentImport.copy(
+                statusMessage = "Select a video or audio file first (or tap Re-Encode on a saved clip)."
+            )
+            return
+        }
+
+        val context = getApplication<Application>().applicationContext
+        val config = uiState.value.config
+
+        viewModelScope.launch {
+            _importEncoderState.value = currentImport.copy(
+                isEncoding = true,
+                encodeProgress = 0.05f,
+                statusMessage = "Starting ${config.videoCodec.label} + ${config.audioCodec.label} (${config.audioBitrateKbps}k) encoder..."
+            )
+
+            val encodedClip = MediaImportEncoderEngine.encodeImportedMedia(
+                context = context,
+                config = config,
+                videoUriString = currentImport.selectedVideoUri,
+                audioUriString = currentImport.selectedAudioUri,
+                onProgress = { progress, message ->
+                    _importEncoderState.value = _importEncoderState.value.copy(
+                        isEncoding = progress < 1.0f,
+                        encodeProgress = progress,
+                        statusMessage = message
+                    )
+                }
+            )
+
+            if (encodedClip != null) {
+                repository.addRecordedClip(encodedClip)
+                _recentSavedBannerClip.value = encodedClip
+                _importEncoderState.value = _importEncoderState.value.copy(
+                    isEncoding = false,
+                    encodeProgress = 1.0f,
+                    statusMessage = "Saved ${encodedClip.title} (${encodedClip.videoCodecLabel} • ${encodedClip.audioCodecLabel})"
+                )
+            } else {
+                _importEncoderState.value = _importEncoderState.value.copy(
+                    isEncoding = false,
+                    encodeProgress = 0f,
+                    statusMessage = "Encoder could not process the selected file. Try another clip."
+                )
+            }
         }
     }
 

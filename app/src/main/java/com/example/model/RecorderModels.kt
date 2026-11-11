@@ -1,5 +1,7 @@
 package com.example.model
 
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
 import java.util.Locale
 
 enum class RecorderStatus {
@@ -48,10 +50,67 @@ enum class ResolutionPreset(
 
 enum class FrameRatePreset(
     val label: String,
-    val fps: Int
+    val shortBadge: String,
+    val fps: Int,
+    val qualityHint: String,
+    val bitrateEfficiencyFactor: Float
 ) {
-    FPS_30("30 FPS", 30),
-    FPS_60("60 FPS", 60)
+    FPS_24("24 FPS", "24fps", 24, "Compact File Size • Cinema", 0.78f),
+    FPS_30("30 FPS", "30fps", 30, "Balanced Quality & Size", 0.88f),
+    FPS_60("60 FPS", "60fps", 60, "Ultra Smooth • High Motion", 1.0f)
+}
+
+enum class VideoEncoderCodec(
+    val label: String,
+    val shortBadge: String,
+    val mimeType: String,
+    val qualityHint: String,
+    val efficiencyFactor: Float
+) {
+    H264_AVC(
+        label = "H.264 AVC",
+        shortBadge = "H.264",
+        mimeType = MediaFormat.MIMETYPE_VIDEO_AVC,
+        qualityHint = "Universal Player Compatibility",
+        efficiencyFactor = 1.0f
+    ),
+    H265_HEVC(
+        label = "H.265 HEVC",
+        shortBadge = "HEVC",
+        mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
+        qualityHint = "High Efficiency • ~32% Smaller",
+        efficiencyFactor = 0.68f
+    )
+}
+
+enum class AudioEncoderCodec(
+    val label: String,
+    val shortBadge: String,
+    val mimeType: String,
+    val aacProfile: Int,
+    val qualityHint: String
+) {
+    AAC_LC(
+        label = "AAC-LC",
+        shortBadge = "AAC",
+        mimeType = MediaFormat.MIMETYPE_AUDIO_AAC,
+        aacProfile = MediaCodecInfo.CodecProfileLevel.AACObjectLC,
+        qualityHint = "Standard Studio MP4 Audio"
+    ),
+    HE_AAC(
+        label = "HE-AAC",
+        shortBadge = "HE-AAC",
+        mimeType = MediaFormat.MIMETYPE_AUDIO_AAC,
+        aacProfile = MediaCodecInfo.CodecProfileLevel.AACObjectHE,
+        qualityHint = "High-Efficiency Voice & Media"
+    ),
+    OPUS(
+        label = "Opus",
+        shortBadge = "Opus",
+        mimeType = MediaFormat.MIMETYPE_AUDIO_OPUS,
+        aacProfile = MediaCodecInfo.CodecProfileLevel.AACObjectLC,
+        qualityHint = "Wideband Dynamic Studio Audio"
+    )
 }
 
 enum class AudioSourceMode(
@@ -80,6 +139,9 @@ enum class GestureIconState {
 data class RecorderConfig(
     val resolution: ResolutionPreset = ResolutionPreset.FULL_SCREEN,
     val frameRate: FrameRatePreset = FrameRatePreset.FPS_60,
+    val videoCodec: VideoEncoderCodec = VideoEncoderCodec.H264_AVC,
+    val audioCodec: AudioEncoderCodec = AudioEncoderCodec.AAC_LC,
+    val audioBitrateKbps: Int = 192,
     val bitrateMbps: Float = 12.0f,
     val audioSource: AudioSourceMode = AudioSourceMode.INTERNAL_PLUS_MIC,
     val autoRecordDurationSeconds: Int = 10,
@@ -90,14 +152,28 @@ data class RecorderConfig(
     val showTouchReticle: Boolean = false,
     val hudPillMode: HudPillMode = HudPillMode.COMPACT_ORB
 ) {
+    val effectiveBitrateMbps: Float
+        get() = (
+            bitrateMbps.coerceIn(1.0f, 24.0f) *
+                frameRate.bitrateEfficiencyFactor *
+                videoCodec.efficiencyFactor
+            ).coerceIn(0.8f, 24.0f)
+
     val bitrateBps: Int
-        get() = (bitrateMbps.coerceIn(1.0f, 24.0f) * 1_000_000f).toInt()
+        get() = (effectiveBitrateMbps * 1_000_000f).toInt()
+
+    val audioBitrateBps: Int
+        get() = audioBitrateKbps.coerceIn(64, 320) * 1_000
 }
 
 data class SavedRecorderPreset(
     val id: String,
     val name: String,
     val resolution: ResolutionPreset,
+    val frameRate: FrameRatePreset = FrameRatePreset.FPS_60,
+    val videoCodec: VideoEncoderCodec = VideoEncoderCodec.H264_AVC,
+    val audioCodec: AudioEncoderCodec = AudioEncoderCodec.AAC_LC,
+    val audioBitrateKbps: Int = 192,
     val bitrateMbps: Float,
     val audioSource: AudioSourceMode,
     val autoRecordDurationSeconds: Int,
@@ -107,13 +183,14 @@ data class SavedRecorderPreset(
     val summaryBadge: String
         get() = String.format(
             Locale.US,
-            "%s • %.1fM • %s • %dx%ds (%ds gap)",
+            "%s • %s • %s • %.1fM • %s %dk • %s",
             resolution.shortBadge,
+            frameRate.shortBadge,
+            videoCodec.shortBadge,
             bitrateMbps,
-            audioSource.shortBadge,
-            multiShotCount,
-            autoRecordDurationSeconds,
-            multiShotGapSeconds
+            audioCodec.shortBadge,
+            audioBitrateKbps,
+            audioSource.shortBadge
         )
 }
 
@@ -130,7 +207,22 @@ data class RecordedClip(
     val createdAtMillis: Long,
     val hasAudio: Boolean,
     val audioSourceLabel: String = "Internal + Mic",
+    val videoCodecLabel: String = "H.264",
+    val audioCodecLabel: String = "AAC 192k",
     val isScreenshot: Boolean = false
+)
+
+data class ImportMediaEncoderState(
+    val selectedVideoUri: String? = null,
+    val selectedVideoName: String? = null,
+    val selectedVideoDurationMs: Long = 0L,
+    val selectedVideoSizeBytes: Long = 0L,
+    val selectedAudioUri: String? = null,
+    val selectedAudioName: String? = null,
+    val selectedAudioDurationMs: Long = 0L,
+    val isEncoding: Boolean = false,
+    val encodeProgress: Float = 0f,
+    val statusMessage: String = "Import a video and/or audio file to encode with your selected Video & Audio codecs."
 )
 
 fun formatFloatingPointTimecode(durationMillis: Long): String {

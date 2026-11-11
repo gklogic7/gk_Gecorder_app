@@ -13,6 +13,7 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.model.AudioEncoderCodec
 import com.example.model.AudioSourceMode
 import com.example.model.FrameRatePreset
 import com.example.model.HudPillMode
@@ -20,6 +21,7 @@ import com.example.model.RecordedClip
 import com.example.model.RecorderConfig
 import com.example.model.ResolutionPreset
 import com.example.model.SavedRecorderPreset
+import com.example.model.VideoEncoderCodec
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -38,6 +40,9 @@ class RecorderRepository(private val context: Context) {
     private object Keys {
         val RESOLUTION = stringPreferencesKey("resolution_aspect")
         val FRAME_RATE = stringPreferencesKey("frame_rate")
+        val VIDEO_CODEC = stringPreferencesKey("video_codec")
+        val AUDIO_CODEC = stringPreferencesKey("audio_codec")
+        val AUDIO_BITRATE_KBPS = intPreferencesKey("audio_bitrate_kbps")
         val BITRATE_MBPS = floatPreferencesKey("bitrate_mbps")
         val AUDIO_SOURCE = stringPreferencesKey("audio_source_v2")
         val AUTO_RECORD_DURATION_SEC = intPreferencesKey("auto_record_duration_sec")
@@ -61,6 +66,17 @@ class RecorderRepository(private val context: Context) {
             frameRate = runCatching {
                 FrameRatePreset.valueOf(prefs[Keys.FRAME_RATE] ?: FrameRatePreset.FPS_60.name)
             }.getOrDefault(FrameRatePreset.FPS_60),
+            videoCodec = runCatching {
+                VideoEncoderCodec.valueOf(
+                    prefs[Keys.VIDEO_CODEC] ?: VideoEncoderCodec.H264_AVC.name
+                )
+            }.getOrDefault(VideoEncoderCodec.H264_AVC),
+            audioCodec = runCatching {
+                AudioEncoderCodec.valueOf(
+                    prefs[Keys.AUDIO_CODEC] ?: AudioEncoderCodec.AAC_LC.name
+                )
+            }.getOrDefault(AudioEncoderCodec.AAC_LC),
+            audioBitrateKbps = (prefs[Keys.AUDIO_BITRATE_KBPS] ?: 192).coerceIn(64, 320),
             bitrateMbps = (prefs[Keys.BITRATE_MBPS] ?: 12.0f).coerceIn(1.0f, 24.0f),
             audioSource = runCatching {
                 AudioSourceMode.valueOf(
@@ -97,6 +113,9 @@ class RecorderRepository(private val context: Context) {
         context.recorderDataStore.edit { prefs ->
             prefs[Keys.RESOLUTION] = config.resolution.name
             prefs[Keys.FRAME_RATE] = config.frameRate.name
+            prefs[Keys.VIDEO_CODEC] = config.videoCodec.name
+            prefs[Keys.AUDIO_CODEC] = config.audioCodec.name
+            prefs[Keys.AUDIO_BITRATE_KBPS] = config.audioBitrateKbps.coerceIn(64, 320)
             prefs[Keys.BITRATE_MBPS] = config.bitrateMbps.coerceIn(1.0f, 24.0f)
             prefs[Keys.AUDIO_SOURCE] = config.audioSource.name
             prefs[Keys.AUTO_RECORD_DURATION_SEC] = config.autoRecordDurationSeconds.coerceIn(3, 300)
@@ -111,12 +130,16 @@ class RecorderRepository(private val context: Context) {
 
     suspend fun saveCustomPreset(name: String, config: RecorderConfig): SavedRecorderPreset {
         val cleanName = name.trim().ifEmpty {
-            "${config.resolution.shortBadge} ${config.audioSource.shortBadge}"
+            "${config.resolution.shortBadge} ${config.videoCodec.shortBadge} ${config.frameRate.shortBadge}"
         }
         val newPreset = SavedRecorderPreset(
             id = System.currentTimeMillis().toString(),
             name = cleanName,
             resolution = config.resolution,
+            frameRate = config.frameRate,
+            videoCodec = config.videoCodec,
+            audioCodec = config.audioCodec,
+            audioBitrateKbps = config.audioBitrateKbps,
             bitrateMbps = config.bitrateMbps,
             audioSource = config.audioSource,
             autoRecordDurationSeconds = config.autoRecordDurationSeconds,
@@ -257,6 +280,8 @@ class RecorderRepository(private val context: Context) {
                                 createdAtMillis = dateAddedSec * 1000L,
                                 hasAudio = true,
                                 audioSourceLabel = "Internal + Mic",
+                                videoCodecLabel = "H.264",
+                                audioCodecLabel = "AAC 192k",
                                 isScreenshot = false
                             )
                         )
@@ -277,8 +302,12 @@ class RecorderRepository(private val context: Context) {
     private fun defaultStarterPresets(): List<SavedRecorderPreset> = listOf(
         SavedRecorderPreset(
             id = "preset_gaming_mix",
-            name = "Full + Int & Mic",
+            name = "Full 60fps H.264 + AAC",
             resolution = ResolutionPreset.FULL_SCREEN,
+            frameRate = FrameRatePreset.FPS_60,
+            videoCodec = VideoEncoderCodec.H264_AVC,
+            audioCodec = AudioEncoderCodec.AAC_LC,
+            audioBitrateKbps = 192,
             bitrateMbps = 16.0f,
             audioSource = AudioSourceMode.INTERNAL_PLUS_MIC,
             autoRecordDurationSeconds = 15,
@@ -286,20 +315,28 @@ class RecorderRepository(private val context: Context) {
             multiShotGapSeconds = 3
         ),
         SavedRecorderPreset(
-            id = "preset_multishot_burst",
-            name = "3x Multi-Shot Burst",
+            id = "preset_hevc_compact",
+            name = "HEVC 60fps + Opus 256k",
             resolution = ResolutionPreset.FULL_SCREEN,
+            frameRate = FrameRatePreset.FPS_60,
+            videoCodec = VideoEncoderCodec.H265_HEVC,
+            audioCodec = AudioEncoderCodec.OPUS,
+            audioBitrateKbps = 256,
             bitrateMbps = 12.0f,
-            audioSource = AudioSourceMode.INTERNAL_AUDIO,
-            autoRecordDurationSeconds = 10,
-            multiShotCount = 3,
+            audioSource = AudioSourceMode.INTERNAL_PLUS_MIC,
+            autoRecordDurationSeconds = 15,
+            multiShotCount = 1,
             multiShotGapSeconds = 3
         ),
         SavedRecorderPreset(
             id = "preset_reels_mic",
-            name = "9:16 Voiceover",
+            name = "9:16 Voiceover 30fps",
             resolution = ResolutionPreset.RATIO_9_16,
-            bitrateMbps = 10.0f,
+            frameRate = FrameRatePreset.FPS_30,
+            videoCodec = VideoEncoderCodec.H264_AVC,
+            audioCodec = AudioEncoderCodec.HE_AAC,
+            audioBitrateKbps = 128,
+            bitrateMbps = 8.0f,
             audioSource = AudioSourceMode.MICROPHONE,
             autoRecordDurationSeconds = 30,
             multiShotCount = 1,
@@ -320,6 +357,16 @@ class RecorderRepository(private val context: Context) {
                             resolution = runCatching {
                                 ResolutionPreset.valueOf(obj.optString("resolution", "FULL_SCREEN"))
                             }.getOrDefault(ResolutionPreset.FULL_SCREEN),
+                            frameRate = runCatching {
+                                FrameRatePreset.valueOf(obj.optString("frameRate", "FPS_60"))
+                            }.getOrDefault(FrameRatePreset.FPS_60),
+                            videoCodec = runCatching {
+                                VideoEncoderCodec.valueOf(obj.optString("videoCodec", "H264_AVC"))
+                            }.getOrDefault(VideoEncoderCodec.H264_AVC),
+                            audioCodec = runCatching {
+                                AudioEncoderCodec.valueOf(obj.optString("audioCodec", "AAC_LC"))
+                            }.getOrDefault(AudioEncoderCodec.AAC_LC),
+                            audioBitrateKbps = obj.optInt("audioBitrateKbps", 192).coerceIn(64, 320),
                             bitrateMbps = obj.optDouble("bitrateMbps", 12.0).toFloat().coerceIn(1f, 24f),
                             audioSource = runCatching {
                                 AudioSourceMode.valueOf(obj.optString("audioSource", "INTERNAL_PLUS_MIC"))
@@ -341,6 +388,10 @@ class RecorderRepository(private val context: Context) {
                 put("id", preset.id)
                 put("name", preset.name)
                 put("resolution", preset.resolution.name)
+                put("frameRate", preset.frameRate.name)
+                put("videoCodec", preset.videoCodec.name)
+                put("audioCodec", preset.audioCodec.name)
+                put("audioBitrateKbps", preset.audioBitrateKbps)
                 put("bitrateMbps", preset.bitrateMbps.toDouble())
                 put("audioSource", preset.audioSource.name)
                 put("autoRecordDurationSeconds", preset.autoRecordDurationSeconds)
@@ -376,6 +427,11 @@ class RecorderRepository(private val context: Context) {
                                 "audioSourceLabel",
                                 if (hasAudio) "Internal + Mic" else "No Audio"
                             ),
+                            videoCodecLabel = obj.optString("videoCodecLabel", "H.264"),
+                            audioCodecLabel = obj.optString(
+                                "audioCodecLabel",
+                                if (hasAudio) "AAC 192k" else "Muted"
+                            ),
                             isScreenshot = obj.optBoolean("isScreenshot", false)
                         )
                     )
@@ -400,6 +456,8 @@ class RecorderRepository(private val context: Context) {
                 put("createdAtMillis", clip.createdAtMillis)
                 put("hasAudio", clip.hasAudio)
                 put("audioSourceLabel", clip.audioSourceLabel)
+                put("videoCodecLabel", clip.videoCodecLabel)
+                put("audioCodecLabel", clip.audioCodecLabel)
                 put("isScreenshot", clip.isScreenshot)
             }
             array.put(obj)

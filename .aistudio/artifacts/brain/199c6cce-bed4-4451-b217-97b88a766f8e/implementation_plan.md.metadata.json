@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan to simplify FloatRec Studio into a lightweight single-screen app with a one-time startup permission setup card, persistent MediaProjection session reuse across multiple recordings, and a minimal floating circular overlay button over other apps that expands when tapped.",
-  "updatedAt":  "2026-11-10T03:25:50.039778580Z",
+  "summary":  "Implementation plan for adding Video & Audio Codec Selectors (H.264 AVC, H.265 HEVC, AAC-LC, HE-AAC, Opus) with Audio Bitrate control (96-320 kbps) in the Recorder Settings card, plus an Import Audio & Video Encoder tool inside the Saved Captures tab while keeping all existing FloatRec features unchanged.",
+  "updatedAt":  "2026-11-11T05:50:13.352400968Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

@@ -8,6 +8,8 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.widget.MediaController
 import android.widget.VideoView
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -17,6 +19,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -26,10 +29,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FiberManualRecord
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
@@ -38,12 +44,14 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -68,8 +76,12 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.example.model.AudioEncoderCodec
+import com.example.model.ImportMediaEncoderState
 import com.example.model.RecordedClip
+import com.example.model.RecorderConfig
 import com.example.model.RecorderStatus
+import com.example.model.VideoEncoderCodec
 import com.example.model.formatFileSize
 import com.example.model.formatFloatingPointTimecode
 import com.example.service.LiveRecordingTelemetry
@@ -91,9 +103,375 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 @Composable
+fun ImportAudioVideoEncoderCard(
+    config: RecorderConfig,
+    importState: ImportMediaEncoderState,
+    onImportVideoClick: () -> Unit,
+    onImportAudioClick: () -> Unit,
+    onClearImportedMedia: () -> Unit,
+    onSelectVideoCodec: (VideoEncoderCodec) -> Unit,
+    onSelectAudioCodec: (AudioEncoderCodec) -> Unit,
+    onSelectAudioBitrateKbps: (Int) -> Unit,
+    onStartEncodeClick: () -> Unit
+) {
+    val audioBitratePresets = listOf(96, 128, 192, 256, 320)
+    val animatedProgress by animateFloatAsState(
+        targetValue = importState.encodeProgress.coerceIn(0f, 1f),
+        label = "encode_progress_anim"
+    )
+    val hasMediaSelected =
+        importState.selectedVideoUri != null || importState.selectedAudioUri != null
+
+    Surface(
+        color = AnodizedSlateSurface,
+        shape = RoundedCornerShape(22.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(
+                width = 1.dp,
+                color = if (importState.isEncoding) AmberSignal else PrecisionCyan.copy(alpha = 0.45f),
+                shape = RoundedCornerShape(22.dp)
+            )
+            .testTag("import_audio_video_encoder_card")
+    ) {
+        Column(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.AutoFixHigh,
+                        contentDescription = null,
+                        tint = PrecisionCyan,
+                        modifier = Modifier.size(17.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "IMPORT AUDIO & VIDEO ENCODER",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = CrispStudioWhite
+                    )
+                }
+
+                Text(
+                    text = "${config.videoCodec.shortBadge} • ${config.audioCodec.shortBadge} ${config.audioBitrateKbps}k",
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = EmeraldReady
+                )
+            }
+
+            // Import Video & Import Audio Buttons Row
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                OutlinedButton(
+                    onClick = onImportVideoClick,
+                    enabled = !importState.isEncoding,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(42.dp)
+                        .testTag("import_video_file_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.VideoFile,
+                        contentDescription = null,
+                        tint = PrecisionCyan,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (importState.selectedVideoName != null) "Change Video" else "Import Video",
+                        color = CrispStudioWhite,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onImportAudioClick,
+                    enabled = !importState.isEncoding,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(42.dp)
+                        .testTag("import_audio_file_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AudioFile,
+                        contentDescription = null,
+                        tint = AmberSignal,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (importState.selectedAudioName != null) "Change Audio" else "Import Audio",
+                        color = CrispStudioWhite,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            // Selected Media Summary Pill
+            if (hasMediaSelected) {
+                Surface(
+                    color = ObsidianBackground.copy(alpha = 0.65f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, GlassBorderSubtle, RoundedCornerShape(12.dp))
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            importState.selectedVideoName?.let { vName ->
+                                Text(
+                                    text = "Video: $vName (${formatFloatingPointTimecode(importState.selectedVideoDurationMs)})",
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    fontSize = 10.5.sp,
+                                    color = PrecisionCyan,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            importState.selectedAudioName?.let { aName ->
+                                Text(
+                                    text = "Audio: $aName (${formatFloatingPointTimecode(importState.selectedAudioDurationMs)})",
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    fontSize = 10.5.sp,
+                                    color = AmberSignal,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+
+                        if (!importState.isEncoding) {
+                            IconButton(
+                                onClick = onClearImportedMedia,
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Clear Imported Media",
+                                    tint = MutedAluminum,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Inline Video Codec + Audio Codec + Audio Bitrate selectors
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "VIDEO:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MutedAluminum,
+                    fontSize = 10.sp
+                )
+                VideoEncoderCodec.entries.forEach { vCodec ->
+                    val selected = config.videoCodec == vCodec
+                    val bg by animateColorAsState(
+                        targetValue = if (selected) PrecisionCyan.copy(alpha = 0.24f) else ElevatedHudSurface,
+                        label = "import_vcodec_bg"
+                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(bg)
+                            .border(
+                                width = 1.dp,
+                                color = if (selected) PrecisionCyan else GlassBorderSubtle,
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable(enabled = !importState.isEncoding) {
+                                onSelectVideoCodec(vCodec)
+                            }
+                            .padding(vertical = 6.dp, horizontal = 6.dp)
+                            .testTag("import_video_codec_${vCodec.name.lowercase(Locale.US)}")
+                    ) {
+                        Text(
+                            text = vCodec.label,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 10.5.sp,
+                            color = if (selected) PrecisionCyan else CrispStudioWhite
+                        )
+                    }
+                }
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "AUDIO:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MutedAluminum,
+                    fontSize = 10.sp
+                )
+                AudioEncoderCodec.entries.forEach { aCodec ->
+                    val selected = config.audioCodec == aCodec
+                    val bg by animateColorAsState(
+                        targetValue = if (selected) EmeraldReady.copy(alpha = 0.24f) else ElevatedHudSurface,
+                        label = "import_acodec_bg"
+                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(bg)
+                            .border(
+                                width = 1.dp,
+                                color = if (selected) EmeraldReady else GlassBorderSubtle,
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable(enabled = !importState.isEncoding) {
+                                onSelectAudioCodec(aCodec)
+                            }
+                            .padding(vertical = 6.dp, horizontal = 4.dp)
+                            .testTag("import_audio_codec_${aCodec.name.lowercase(Locale.US)}")
+                    ) {
+                        Text(
+                            text = aCodec.label,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 10.sp,
+                            color = if (selected) EmeraldReady else CrispStudioWhite
+                        )
+                    }
+                }
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "KBPS:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MutedAluminum,
+                    fontSize = 10.sp
+                )
+                audioBitratePresets.forEach { kbps ->
+                    val selected = config.audioBitrateKbps == kbps
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selected) AmberSignal else ElevatedHudSurface)
+                            .clickable(enabled = !importState.isEncoding) {
+                                onSelectAudioBitrateKbps(kbps)
+                            }
+                            .padding(vertical = 5.dp)
+                            .testTag("import_audio_kbps_$kbps")
+                    ) {
+                        Text(
+                            text = "${kbps}k",
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 10.sp,
+                            color = if (selected) ObsidianBackground else CrispStudioWhite
+                        )
+                    }
+                }
+            }
+
+            if (importState.isEncoding || importState.encodeProgress > 0f) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(ElevatedHudSurface)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(animatedProgress)
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(if (importState.isEncoding) AmberSignal else EmeraldReady)
+                    )
+                }
+            }
+
+            Text(
+                text = importState.statusMessage,
+                style = MaterialTheme.typography.bodyMedium,
+                fontSize = 11.sp,
+                color = if (importState.isEncoding) AmberSignal else MutedAluminum,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            Button(
+                onClick = onStartEncodeClick,
+                enabled = !importState.isEncoding && hasMediaSelected,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = PrecisionCyan,
+                    contentColor = ObsidianBackground,
+                    disabledContainerColor = ElevatedHudSurface,
+                    disabledContentColor = MutedAluminum
+                ),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(42.dp)
+                    .testTag("encode_imported_media_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.GraphicEq,
+                    contentDescription = null,
+                    modifier = Modifier.size(17.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (importState.isEncoding) {
+                        "Encoding ${config.videoCodec.shortBadge} + ${config.audioCodec.shortBadge}..."
+                    } else {
+                        "Encode & Save (${config.videoCodec.shortBadge} • ${config.frameRate.shortBadge} • ${config.audioCodec.shortBadge} ${config.audioBitrateKbps}k)"
+                    },
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun RecordedClipCard(
     clip: RecordedClip,
     onPlay: () -> Unit,
+    onReEncode: (() -> Unit)? = null,
     onRename: () -> Unit,
     onShare: () -> Unit,
     onDelete: () -> Unit
@@ -207,7 +585,7 @@ fun RecordedClipCard(
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
                         text = if (clip.isScreenshot) {
@@ -220,75 +598,102 @@ fun RecordedClipCard(
                         fontWeight = FontWeight.Bold,
                         color = if (clip.isScreenshot) PrecisionCyan else TallyRecordingRed
                     )
-                    Text(
-                        text = "•",
-                        color = MutedAluminum
-                    )
+                    Text(text = "•", color = MutedAluminum)
                     Text(
                         text = formatFileSize(clip.sizeBytes),
                         fontFamily = JetBrainsMonoFontFamily,
                         fontSize = 11.sp,
                         color = CrispStudioWhite
                     )
+                    if (!clip.isScreenshot) {
+                        Text(text = "•", color = MutedAluminum)
+                        Text(
+                            text = clip.videoCodecLabel,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontSize = 10.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AmberSignal
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(4.dp))
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     if (!clip.isScreenshot) {
                         Icon(
                             imageVector = if (clip.hasAudio) Icons.Default.Mic else Icons.Default.MicOff,
                             contentDescription = null,
-                            tint = MutedAluminum,
+                            tint = if (clip.hasAudio) EmeraldReady else MutedAluminum,
                             modifier = Modifier.size(12.dp)
                         )
                         Text(
-                            text = clip.audioSourceLabel,
-                            style = MaterialTheme.typography.labelMedium,
+                            text = clip.audioCodecLabel,
+                            fontFamily = JetBrainsMonoFontFamily,
                             color = PrecisionCyan,
-                            fontSize = 10.5.sp
-                        )
-                        Text(
-                            text = "•",
-                            color = MutedAluminum,
                             fontSize = 10.sp
                         )
+                        Text(text = "•", color = MutedAluminum, fontSize = 10.sp)
+                        Text(
+                            text = "${clip.fps} FPS",
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = EmeraldReady
+                        )
+                        Text(text = "•", color = MutedAluminum, fontSize = 10.sp)
                     }
                     Text(
                         text = formattedDate,
                         style = MaterialTheme.typography.bodyMedium,
                         color = MutedAluminum,
-                        fontSize = 11.sp
+                        fontSize = 10.5.sp,
+                        maxLines = 1
                     )
                 }
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onRename, modifier = Modifier.size(36.dp)) {
+                if (!clip.isScreenshot && onReEncode != null) {
+                    IconButton(
+                        onClick = onReEncode,
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("reencode_clip_${clip.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoFixHigh,
+                            contentDescription = "Load into Audio/Video Encoder",
+                            tint = AmberSignal,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
+                }
+                IconButton(onClick = onRename, modifier = Modifier.size(34.dp)) {
                     Icon(
                         imageVector = Icons.Default.Edit,
                         contentDescription = "Rename",
                         tint = MutedAluminum,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(17.dp)
                     )
                 }
-                IconButton(onClick = onShare, modifier = Modifier.size(36.dp)) {
+                IconButton(onClick = onShare, modifier = Modifier.size(34.dp)) {
                     Icon(
                         imageVector = Icons.Default.Share,
                         contentDescription = "Share",
                         tint = PrecisionCyan,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(17.dp)
                     )
                 }
-                IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
+                IconButton(onClick = onDelete, modifier = Modifier.size(34.dp)) {
                     Icon(
                         imageVector = Icons.Default.DeleteOutline,
                         contentDescription = "Delete",
                         tint = TallyRecordingRed,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(17.dp)
                     )
                 }
             }
@@ -305,6 +710,10 @@ fun ClipPlaybackDialog(
 ) {
     val context = LocalContext.current
     var screenshotBitmap by remember(clip.uriString) { mutableStateOf<Bitmap?>(null) }
+    var isPlaybackMuted by remember(clip.uriString) { mutableStateOf(false) }
+    var activeMediaPlayer by remember(clip.uriString) {
+        mutableStateOf<android.media.MediaPlayer?>(null)
+    }
 
     LaunchedEffect(clip.uriString, clip.filePath, clip.isScreenshot) {
         if (clip.isScreenshot) {
@@ -354,11 +763,26 @@ fun ClipPlaybackDialog(
                             text = if (clip.isScreenshot) {
                                 "SCREENSHOT PNG • ${formatFileSize(clip.sizeBytes)}"
                             } else {
-                                "${formatFloatingPointTimecode(clip.durationMillis)} • ${formatFileSize(clip.sizeBytes)}"
+                                "${formatFloatingPointTimecode(clip.durationMillis)} • ${clip.videoCodecLabel} • ${clip.fps} FPS • ${clip.audioCodecLabel} • ${formatFileSize(clip.sizeBytes)}"
                             },
                             style = MaterialTheme.typography.labelMedium,
                             color = PrecisionCyan
                         )
+                    }
+                    if (!clip.isScreenshot && clip.hasAudio) {
+                        IconButton(
+                            onClick = {
+                                isPlaybackMuted = !isPlaybackMuted
+                                val vol = if (isPlaybackMuted) 0f else 1f
+                                runCatching { activeMediaPlayer?.setVolume(vol, vol) }
+                            }
+                        ) {
+                            Icon(
+                                imageVector = if (isPlaybackMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                                contentDescription = if (isPlaybackMuted) "Unmute Audio" else "Mute Audio",
+                                tint = if (isPlaybackMuted) AmberSignal else EmeraldReady
+                            )
+                        }
                     }
                     IconButton(onClick = onDismiss) {
                         Icon(
@@ -409,7 +833,10 @@ fun ClipPlaybackDialog(
                                         setVideoURI(Uri.parse(clip.uriString))
                                     }
                                     setOnPreparedListener { mp ->
+                                        activeMediaPlayer = mp
                                         mp.isLooping = true
+                                        val vol = if (isPlaybackMuted) 0f else 1.0f
+                                        runCatching { mp.setVolume(vol, vol) }
                                         start()
                                     }
                                 }

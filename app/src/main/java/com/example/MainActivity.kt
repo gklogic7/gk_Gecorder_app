@@ -69,6 +69,7 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.MotionPhotosOn
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Speed
@@ -111,19 +112,23 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.model.AudioEncoderCodec
 import com.example.model.AudioSourceMode
 import com.example.model.CaptureFilterTab
+import com.example.model.FrameRatePreset
 import com.example.model.GestureIconState
 import com.example.model.RecorderConfig
 import com.example.model.RecorderStatus
 import com.example.model.RecorderSubTab
 import com.example.model.ResolutionPreset
 import com.example.model.SavedRecorderPreset
+import com.example.model.VideoEncoderCodec
 import com.example.model.formatFileSize
 import com.example.model.formatFloatingPointTimecode
 import com.example.service.ScreenRecorderStateHolder
 import com.example.ui.components.ClipPlaybackDialog
 import com.example.ui.components.DraggableFloatingHudPill
+import com.example.ui.components.ImportAudioVideoEncoderCard
 import com.example.ui.components.PipCompactHudView
 import com.example.ui.components.RecordedClipCard
 import com.example.ui.components.RenameClipDialog
@@ -174,8 +179,6 @@ class MainActivity : ComponentActivity() {
                 }
 
                 // Single One-Time Entire-Screen Capture Authorization Launcher
-                // Uses MediaProjectionConfig.createConfigForDefaultDisplay() so Android
-                // ALWAYS captures the entire screen without asking which app/screen to record.
                 val wholeScreenProjectionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
                 ) { result ->
@@ -199,8 +202,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Combined runtime permission launcher (RECORD_AUDIO + POST_NOTIFICATIONS)
-                // that chains directly into the one-time Entire Screen session arming
                 val runtimePermissionsBeforeArmLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
                 ) {
@@ -266,8 +267,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Auto-arm once when opening app so user authorizes Entire Screen once
-                // and is never prompted again during subsequent recordings/screenshots
                 LaunchedEffect(uiState.telemetry.isSessionArmed) {
                     if (!uiState.telemetry.isSessionArmed && !hasAutoArmedOnStartup) {
                         hasAutoArmedOnStartup = true
@@ -365,10 +364,6 @@ class MainActivity : ComponentActivity() {
         isInPipModeState = isInPictureInPictureMode
     }
 
-    /**
-     * Always requests Entire Screen (`createConfigForDefaultDisplay`) on Android 14+
-     * so Android never asks "Record a single app or Entire screen".
-     */
     private fun createWholeScreenCaptureIntent(context: Context): Intent {
         val manager =
             context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -439,7 +434,22 @@ fun SimpleSingleScreenRecorderApp(
 
     var showSavePresetDialog by remember { mutableStateOf(false) }
 
-    // Return to Recorder subtab when pressing Back from Saved Captures subtab
+    val importVideoDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            viewModel.selectImportedVideo(uri)
+        }
+    }
+
+    val importAudioDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            viewModel.selectImportedAudio(uri)
+        }
+    }
+
     BackHandler(enabled = uiState.activeSubTab == RecorderSubTab.SAVED_CAPTURES) {
         viewModel.selectSubTab(RecorderSubTab.RECORDER)
     }
@@ -487,7 +497,6 @@ fun SimpleSingleScreenRecorderApp(
                         .widthIn(max = 560.dp)
                         .testTag("single_screen_list")
                 ) {
-                    // Instant Saved Clip / Screenshot Toast Banner
                     item {
                         AnimatedVisibility(
                             visible = uiState.recentSavedBannerClip != null,
@@ -500,7 +509,7 @@ fun SimpleSingleScreenRecorderApp(
                                     clipMeta = if (clip.isScreenshot) {
                                         "Screenshot PNG • ${formatFileSize(clip.sizeBytes)}"
                                     } else {
-                                        "${formatFloatingPointTimecode(clip.durationMillis)} • ${formatFileSize(clip.sizeBytes)} • ${clip.audioSourceLabel}"
+                                        "${formatFloatingPointTimecode(clip.durationMillis)} • ${clip.fps} FPS • ${formatFileSize(clip.sizeBytes)} • ${clip.audioSourceLabel}"
                                     },
                                     onPlayClick = {
                                         viewModel.dismissSavedBanner()
@@ -529,7 +538,7 @@ fun SimpleSingleScreenRecorderApp(
                             )
                         }
 
-                        // 2. Audio Source (with Live Check & Meter), Resolution & Mbps Slider Card
+                        // 2. Audio Source, Video & Audio Encoder Codecs, Frame Rate (24/30/60fps), Resolution & Mbps Slider Card
                         item {
                             CaptureSettingsCard(
                                 config = uiState.config,
@@ -537,6 +546,10 @@ fun SimpleSingleScreenRecorderApp(
                                 isLocked = isRecordingOrPaused,
                                 onSelectAudioSource = onSelectAudioSource,
                                 onCheckAudioClick = onCheckAudioClick,
+                                onSelectVideoCodec = viewModel::setVideoCodec,
+                                onSelectAudioCodec = viewModel::setAudioCodec,
+                                onSelectAudioBitrateKbps = viewModel::setAudioBitrateKbps,
+                                onSelectFrameRate = viewModel::setFrameRate,
                                 onSelectResolution = viewModel::setResolution,
                                 onBitrateMbpsChange = viewModel::setBitrateMbps
                             )
@@ -556,7 +569,25 @@ fun SimpleSingleScreenRecorderApp(
                             )
                         }
                     } else {
-                        // SUBTAB 2: SAVED CAPTURES & SCREENSHOTS
+                        // SUBTAB 2: SAVED CAPTURES & IMPORT AUDIO/VIDEO ENCODER
+                        item {
+                            ImportAudioVideoEncoderCard(
+                                config = uiState.config,
+                                importState = uiState.importEncoderState,
+                                onImportVideoClick = {
+                                    importVideoDocumentLauncher.launch(arrayOf("video/*"))
+                                },
+                                onImportAudioClick = {
+                                    importAudioDocumentLauncher.launch(arrayOf("audio/*"))
+                                },
+                                onClearImportedMedia = viewModel::clearImportedMedia,
+                                onSelectVideoCodec = viewModel::setVideoCodec,
+                                onSelectAudioCodec = viewModel::setAudioCodec,
+                                onSelectAudioBitrateKbps = viewModel::setAudioBitrateKbps,
+                                onStartEncodeClick = viewModel::runImportAudioVideoEncoder
+                            )
+                        }
+
                         item {
                             SavedCapturesSubTabHeader(
                                 activeFilter = uiState.activeCaptureFilter,
@@ -578,6 +609,11 @@ fun SimpleSingleScreenRecorderApp(
                                 RecordedClipCard(
                                     clip = clip,
                                     onPlay = { viewModel.openClipPlayback(clip) },
+                                    onReEncode = if (clip.isScreenshot) {
+                                        null
+                                    } else {
+                                        { viewModel.loadExistingClipIntoEncoder(clip) }
+                                    },
                                     onRename = { viewModel.promptRenameClip(clip) },
                                     onShare = { shareRecordedClip(context, clip) },
                                     onDelete = { viewModel.deleteClip(clip) }
@@ -587,7 +623,6 @@ fun SimpleSingleScreenRecorderApp(
                     }
                 }
 
-                // In-app Minimal Floating Circular Gesture Button (with SVG icons & Drag Down to Close)
                 DraggableFloatingHudPill(
                     config = uiState.config,
                     telemetry = uiState.telemetry,
@@ -599,7 +634,6 @@ fun SimpleSingleScreenRecorderApp(
             }
         }
 
-        // Save Custom Preset Dialog
         if (showSavePresetDialog) {
             SavePresetDialog(
                 config = uiState.config,
@@ -611,7 +645,6 @@ fun SimpleSingleScreenRecorderApp(
             )
         }
 
-        // Video / Screenshot Preview Modal
         uiState.selectedClipForPlayback?.let { selectedClip ->
             ClipPlaybackDialog(
                 clip = selectedClip,
@@ -621,7 +654,6 @@ fun SimpleSingleScreenRecorderApp(
             )
         }
 
-        // Rename Clip Dialog
         uiState.clipToRename?.let { renameTarget ->
             RenameClipDialog(
                 clip = renameTarget,
@@ -781,7 +813,6 @@ private fun WholeScreenGestureHubCard(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Main Multi-Gesture Circular Button (1x Tap = Rec/Stop, 2x Tap = SS, Hold = Multi-Shot Auto-Record)
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
@@ -830,7 +861,6 @@ private fun WholeScreenGestureHubCard(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 3 Gesture Action Tiles with Custom SVG Icons
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
@@ -870,7 +900,6 @@ private fun WholeScreenGestureHubCard(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Multi-Shot & Auto-Record Duration Configuration Box
             Surface(
                 color = ObsidianBackground.copy(alpha = 0.55f),
                 shape = RoundedCornerShape(16.dp),
@@ -882,7 +911,6 @@ private fun WholeScreenGestureHubCard(
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                     modifier = Modifier.padding(12.dp)
                 ) {
-                    // Row 1: Hold Auto-Record Clip Time
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -928,7 +956,6 @@ private fun WholeScreenGestureHubCard(
                         }
                     }
 
-                    // Row 2: Multi-Shot Count (1x, 2x, 3x, 5x, 10x shots)
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -966,7 +993,6 @@ private fun WholeScreenGestureHubCard(
                         }
                     }
 
-                    // Row 3: Gap Between Shots (0s, 1s, 2s, 3s, 5s, 10s)
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1260,6 +1286,10 @@ private fun CaptureSettingsCard(
     isLocked: Boolean,
     onSelectAudioSource: (AudioSourceMode) -> Unit,
     onCheckAudioClick: () -> Unit,
+    onSelectVideoCodec: (VideoEncoderCodec) -> Unit,
+    onSelectAudioCodec: (AudioEncoderCodec) -> Unit,
+    onSelectAudioBitrateKbps: (Int) -> Unit,
+    onSelectFrameRate: (FrameRatePreset) -> Unit,
     onSelectResolution: (ResolutionPreset) -> Unit,
     onBitrateMbpsChange: (Float) -> Unit
 ) {
@@ -1269,11 +1299,12 @@ private fun CaptureSettingsCard(
         Manifest.permission.RECORD_AUDIO
     ) == PackageManager.PERMISSION_GRANTED
 
-    val estimatedMbPerMinute = (config.bitrateMbps * 60f) / 8f
+    val estimatedMbPerMinute = (config.effectiveBitrateMbps * 60f) / 8f
     val animatedPeak by animateFloatAsState(
         targetValue = telemetry.audioPeakLevel.coerceIn(0f, 1f),
         label = "audio_peak_anim"
     )
+    val audioBitratePresets = listOf(96, 128, 192, 256, 320)
 
     Surface(
         color = AnodizedSlateSurface,
@@ -1383,7 +1414,7 @@ private fun CaptureSettingsCard(
                             telemetry.isAudioMonitorActive ->
                                 telemetry.audioStatusDetail
                             else ->
-                                "${config.audioSource.label} Ready (44.1 kHz AAC)"
+                                "${config.audioSource.label} • ${config.audioCodec.label} ${config.audioBitrateKbps} kbps (44.1 kHz)"
                         }
                         Text(
                             text = diagText,
@@ -1423,7 +1454,6 @@ private fun CaptureSettingsCard(
                         }
                     }
 
-                    // Live Audio Signal Level Bar
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1437,7 +1467,7 @@ private fun CaptureSettingsCard(
                                     fraction = if (config.audioSource == AudioSourceMode.NO_AUDIO) {
                                         0f
                                     } else {
-                                        animatedPeak.coerceAtLeast(if (hasMicPermission) 0.06f else 0f)
+                                        animatedPeak.coerceAtLeast(if (hasMicPermission) 0.08f else 0f)
                                     }
                                 )
                                 .fillMaxHeight()
@@ -1450,7 +1480,258 @@ private fun CaptureSettingsCard(
                 }
             }
 
-            // 2. Resolution Ratio Selector: Full Screen, 16:9, 9:16, 1:1
+            // 2. Video Encoder Codec Selector: H.264 AVC, H.265 HEVC
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.VideoLibrary,
+                        contentDescription = null,
+                        tint = PrecisionCyan,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "VIDEO ENCODER",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MutedAluminum
+                    )
+                }
+                Text(
+                    text = "${config.videoCodec.label} • ${config.videoCodec.qualityHint}",
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = PrecisionCyan
+                )
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                VideoEncoderCodec.entries.forEach { vCodec ->
+                    val isSelected = config.videoCodec == vCodec
+                    val chipBg by animateColorAsState(
+                        targetValue = if (isSelected) PrecisionCyan.copy(alpha = 0.22f) else ElevatedHudSurface,
+                        label = "video_codec_chip_bg"
+                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(chipBg.copy(alpha = if (isLocked) 0.5f else 1f))
+                            .border(
+                                width = 1.dp,
+                                color = if (isSelected) PrecisionCyan else GlassBorderSubtle,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                            .clickable(enabled = !isLocked) { onSelectVideoCodec(vCodec) }
+                            .padding(vertical = 8.dp, horizontal = 6.dp)
+                            .testTag("video_codec_option_${vCodec.name.lowercase(Locale.US)}")
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = vCodec.label,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSelected) PrecisionCyan else CrispStudioWhite
+                            )
+                            Text(
+                                text = if (vCodec == VideoEncoderCodec.H265_HEVC) {
+                                    "~32% Smaller File"
+                                } else {
+                                    "Universal MP4"
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontSize = 9.5.sp,
+                                color = if (isSelected) CrispStudioWhite else MutedAluminum
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 3. Audio Encoder Codec (AAC-LC, HE-AAC, Opus) + Audio Bitrate (96k - 320k)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.GraphicEq,
+                        contentDescription = null,
+                        tint = EmeraldReady,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "AUDIO ENCODER & BITRATE",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MutedAluminum
+                    )
+                }
+                Text(
+                    text = "${config.audioCodec.label} • ${config.audioBitrateKbps} kbps",
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = EmeraldReady
+                )
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                AudioEncoderCodec.entries.forEach { aCodec ->
+                    val isSelected = config.audioCodec == aCodec
+                    val chipBg by animateColorAsState(
+                        targetValue = if (isSelected) EmeraldReady.copy(alpha = 0.22f) else ElevatedHudSurface,
+                        label = "audio_codec_chip_bg"
+                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(chipBg.copy(alpha = if (isLocked) 0.5f else 1f))
+                            .border(
+                                width = 1.dp,
+                                color = if (isSelected) EmeraldReady else GlassBorderSubtle,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                            .clickable(enabled = !isLocked) { onSelectAudioCodec(aCodec) }
+                            .padding(vertical = 8.dp, horizontal = 4.dp)
+                            .testTag("audio_codec_option_${aCodec.name.lowercase(Locale.US)}")
+                    ) {
+                        Text(
+                            text = aCodec.label,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isSelected) EmeraldReady else CrispStudioWhite
+                        )
+                    }
+                }
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "AUDIO KBPS:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MutedAluminum,
+                    fontSize = 10.sp
+                )
+                audioBitratePresets.forEach { kbps ->
+                    val isSelected = config.audioBitrateKbps == kbps
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (isSelected) EmeraldReady else ElevatedHudSurface)
+                            .clickable(enabled = !isLocked) { onSelectAudioBitrateKbps(kbps) }
+                            .padding(vertical = 5.dp)
+                            .testTag("audio_bitrate_${kbps}k_chip")
+                    ) {
+                        Text(
+                            text = "${kbps}k",
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 10.sp,
+                            color = if (isSelected) ObsidianBackground else CrispStudioWhite
+                        )
+                    }
+                }
+            }
+
+            // 4. Frame Rate Selector: 24 FPS, 30 FPS, 60 FPS (Quality & File Size Optimization)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.MotionPhotosOn,
+                        contentDescription = null,
+                        tint = AmberSignal,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "FRAME RATE (FPS)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MutedAluminum
+                    )
+                }
+                Text(
+                    text = "${config.frameRate.label} • ${config.frameRate.qualityHint}",
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = AmberSignal
+                )
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                FrameRatePreset.entries.forEach { fpsPreset ->
+                    val isSelected = config.frameRate == fpsPreset
+                    val chipBg by animateColorAsState(
+                        targetValue = if (isSelected) AmberSignal.copy(alpha = 0.24f) else ElevatedHudSurface,
+                        label = "fps_chip_bg"
+                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(chipBg.copy(alpha = if (isLocked) 0.5f else 1f))
+                            .border(
+                                width = 1.dp,
+                                color = if (isSelected) AmberSignal else GlassBorderSubtle,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                            .clickable(enabled = !isLocked) { onSelectFrameRate(fpsPreset) }
+                            .padding(vertical = 9.dp, horizontal = 6.dp)
+                            .testTag("framerate_option_${fpsPreset.fps}fps")
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = fpsPreset.label,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSelected) AmberSignal else CrispStudioWhite
+                            )
+                            Text(
+                                text = when (fpsPreset) {
+                                    FrameRatePreset.FPS_24 -> "Smaller File"
+                                    FrameRatePreset.FPS_30 -> "Balanced"
+                                    FrameRatePreset.FPS_60 -> "Ultra Smooth"
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontSize = 9.5.sp,
+                                color = if (isSelected) CrispStudioWhite else MutedAluminum,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 5. Resolution Ratio Selector: Full Screen, 16:9, 9:16, 1:1
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1516,7 +1797,7 @@ private fun CaptureSettingsCard(
                 }
             }
 
-            // 3. Floating-Point Mbps Bitrate Slider
+            // 6. Floating-Point Mbps Bitrate Slider
             Column(modifier = Modifier.fillMaxWidth()) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -1548,9 +1829,15 @@ private fun CaptureSettingsCard(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = String.format(Locale.US, "(~%.0f MB/min)", estimatedMbPerMinute),
+                            text = String.format(
+                                Locale.US,
+                                "(~%.0f MB/min • %s @ %dfps)",
+                                estimatedMbPerMinute,
+                                config.videoCodec.shortBadge,
+                                config.frameRate.fps
+                            ),
                             fontFamily = JetBrainsMonoFontFamily,
-                            fontSize = 10.5.sp,
+                            fontSize = 10.sp,
                             color = MutedAluminum
                         )
                     }
@@ -1689,6 +1976,10 @@ private fun SaveOptionsSystemCard(
                     items(savedPresets, key = { it.id }) { preset ->
                         val isCurrentMatch =
                             preset.resolution == config.resolution &&
+                                preset.frameRate == config.frameRate &&
+                                preset.videoCodec == config.videoCodec &&
+                                preset.audioCodec == config.audioCodec &&
+                                preset.audioBitrateKbps == config.audioBitrateKbps &&
                                 preset.audioSource == config.audioSource &&
                                 preset.autoRecordDurationSeconds == config.autoRecordDurationSeconds &&
                                 preset.multiShotCount == config.multiShotCount &&
@@ -1775,10 +2066,12 @@ private fun SavedCapturesSubTabHeader(
             Text(
                 text = String.format(
                     Locale.US,
-                    "%s • %.1f Mbps • %s",
-                    config.resolution.label,
-                    config.bitrateMbps,
-                    config.audioSource.shortBadge
+                    "%s • %s • %s • %s %dk",
+                    config.resolution.shortBadge,
+                    config.videoCodec.shortBadge,
+                    config.frameRate.shortBadge,
+                    config.audioCodec.shortBadge,
+                    config.audioBitrateKbps
                 ),
                 style = MaterialTheme.typography.labelMedium,
                 color = PrecisionCyan
@@ -1833,7 +2126,7 @@ private fun SavePresetDialog(
 ) {
     var presetName by remember {
         mutableStateOf(
-            "${config.resolution.shortBadge} ${config.audioSource.shortBadge} (${config.multiShotCount}x${config.autoRecordDurationSeconds}s)"
+            "${config.resolution.shortBadge} ${config.videoCodec.shortBadge} ${config.frameRate.shortBadge} ${config.audioCodec.shortBadge}"
         )
     }
     AlertDialog(
@@ -1845,7 +2138,7 @@ private fun SavePresetDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = "Saves Audio (${config.audioSource.label}), Resolution (${config.resolution.label}), Bitrate (${config.bitrateMbps} Mbps), and Multi-Shot (${config.multiShotCount}x ${config.autoRecordDurationSeconds}s, ${config.multiShotGapSeconds}s gap).",
+                    text = "Saves Video Codec (${config.videoCodec.label}), Audio Codec (${config.audioCodec.label} @ ${config.audioBitrateKbps}k), Audio Source (${config.audioSource.label}), Frame Rate (${config.frameRate.label}), Resolution (${config.resolution.label}), and Bitrate (${config.bitrateMbps} Mbps).",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MutedAluminum
                 )
