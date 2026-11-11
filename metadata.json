@@ -1,0 +1,6 @@
+{
+  "name": "FloatRec Studio",
+  "description": "Tactile floating-point screen recorder with magnetic HUD controls, live frame telemetry, and instant clip review.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

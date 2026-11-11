@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">FloatRec Studio</string>
+    <string name="status_standby">STANDBY</string>
+    <string name="status_recording">RECORDING</string>
+    <string name="status_paused">PAUSED</string>
+    <string name="status_countdown">ARMED</string>
+    <string name="tab_recorder_deck">Recorder Deck</string>
+    <string name="tab_test_stage">Interactive Stage</string>
+    <string name="tab_recordings">Saved Clips</string>
+    <string name="hud_toggle_label">Floating Point HUD</string>
+    <string name="hud_reticle_label">Floating Touch Reticle</string>
+    <string name="pip_float_label">Float Over Apps (PiP)</string>
+    <string name="resolution_720p">720p HD</string>
+    <string name="resolution_1080p">1080p FHD</string>
+    <string name="fps_30">30 FPS</string>
+    <string name="fps_60">60 FPS</string>
+    <string name="bitrate_8m">8 Mbps</string>
+    <string name="bitrate_16m">16 Mbps</string>
+    <string name="audio_mic">Mic Audio</string>
+    <string name="audio_mute">Muted</string>
+    <string name="empty_clips_title">No Screen Captures Yet</string>
+    <string name="empty_clips_subtitle">Arm the shutter or tap REC on the Floating Point HUD pill to record your screen with sub-second precision.</string>
+    <string name="notification_channel_name">Screen Recording Session</string>
+    <string name="notification_channel_desc">Active floating-point screen recording controls and telemetry</string>
+</resources>
